@@ -1,0 +1,10 @@
+**/.git
+**/.env
+**/.env.*
+**/node_modules
+**/dist
+**/.pi
+**/bin
+**/.idea
+**/test-results
+**/playwright-report

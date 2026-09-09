@@ -1,0 +1,705 @@
+package app
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"FileCabinet/internal/config"
+	"FileCabinet/internal/modelscope"
+	"FileCabinet/internal/store"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+)
+
+type fakeUpstream struct {
+	afterCommit                     func()
+	mu                              sync.Mutex
+	commits, deletes, puts          int
+	failCommit, failDelete, failPut bool
+	uncertainDelete                 bool
+	validateURL                     string
+	deleteEntered, deleteRelease    chan struct{}
+	content                         []byte
+}
+
+func (u *fakeUpstream) Validate(context.Context, string, int64) (string, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.validateURL, nil
+}
+func (u *fakeUpstream) Put(_ context.Context, _, _ string, r io.Reader, _ int64) error {
+	u.mu.Lock()
+	u.puts++
+	bad := u.failPut
+	u.mu.Unlock()
+	if bad {
+		return modelscope.ErrUpstream
+	}
+	_, e := io.Copy(io.Discard, r)
+	return e
+}
+func (u *fakeUpstream) Commit(_ context.Context, _, _ string, _ int64, b []byte) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.commits++
+	u.content = append([]byte(nil), b...)
+	if u.afterCommit != nil {
+		u.afterCommit()
+	}
+	if u.failCommit {
+		return modelscope.ErrUpstream
+	}
+	return nil
+}
+func (u *fakeUpstream) Delete(context.Context, string) error {
+	if u.deleteEntered != nil {
+		u.deleteEntered <- struct{}{}
+		<-u.deleteRelease
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.deletes++
+	if u.uncertainDelete {
+		return modelscope.ErrUncertainMutation
+	}
+	if u.failDelete {
+		return modelscope.ErrUpstream
+	}
+	return nil
+}
+func (u *fakeUpstream) Download(context.Context, string) (*http.Response, error) {
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(u.content))}, nil
+}
+func setup(t *testing.T) (*Service, *fakeUpstream, *miniredis.Miniredis) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	r := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { r.Close() })
+	s := store.New(r, "test:")
+	if e := s.Claim(context.Background()); e != nil {
+		t.Fatal(e)
+	}
+	c := config.Config{Namespace: "05", UploadMode: "proxy", MaxBytes: 20 << 20, Timeout: time.Second * 10}
+	u := &fakeUpstream{}
+	a := New(c, s, u)
+	a.Now = func() time.Time { return time.Unix(1800000000, 0) }
+	return a, u, mr
+}
+func file(data []byte, expiry int64) store.File {
+	h := sha256.Sum256(data)
+	return store.File{Hash: hex.EncodeToString(h[:]), Name: "说明.txt", Size: int64(len(data)), ExpiresAt: expiry}
+}
+func TestExpiryRules(t *testing.T) {
+	now := int64(1000)
+	for _, tt := range []struct{ old, new, want int64 }{{0, 2000, 0}, {2000, 0, 0}, {2000, 3000, 3000}, {3000, 2000, 3000}} {
+		if got := MergeExpiry(tt.old, tt.new); got != tt.want {
+			t.Fatalf("merge got %d", got)
+		}
+	}
+	for _, tt := range []struct {
+		file, custom, want int64
+		bad                bool
+	}{{0, 0, now + 604800, false}, {2000, 0, 2000, false}, {2000, 1999, 1999, false}, {2000, 2000, 0, true}, {1000, 0, 0, true}, {0, 1000, 0, true}, {0, now + 604800, 0, true}} {
+		got, e := CodeExpiry(tt.file, tt.custom, now)
+		if (e != nil) != tt.bad || got != tt.want {
+			t.Fatalf("expiry %+v got %d %v", tt, got, e)
+		}
+	}
+}
+func TestProxyDuplicateAndHashVerification(t *testing.T) {
+	a, u, _ := setup(t)
+	ctx := context.Background()
+	b := []byte("hello")
+	f := file(b, a.Now().Unix()+3600)
+	saved, e := a.Upload(ctx, f, bytes.NewReader(b))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if a.Path(f.Hash) != "05/"+f.Hash[:2]+"/"+f.Hash[2:] {
+		t.Fatal("path")
+	}
+	if !bytes.Equal(u.content, b) || saved.CreatedAt == 0 {
+		t.Fatal("not committed")
+	}
+	f.ExpiresAt = a.Now().Unix() + 86400
+	if _, e = a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	got, _ := a.S.Get(ctx, f.Hash)
+	if got.ExpiresAt != f.ExpiresAt || u.commits != 1 {
+		t.Fatal("duplicate did not extend")
+	}
+	f.ExpiresAt = 0
+	if _, e = a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	f.ExpiresAt = a.Now().Unix() + 10
+	if _, e = a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	got, _ = a.S.Get(ctx, f.Hash)
+	if got.ExpiresAt != 0 {
+		t.Fatal("permanent shortened")
+	}
+	if _, e = a.Upload(ctx, f, strings.NewReader("wrong")); !errors.Is(e, ErrInvalid) {
+		t.Fatalf("expected hash reject: %v", e)
+	}
+	if u.commits != 1 {
+		t.Fatal("bad commit")
+	}
+}
+func TestUploadFailureNeverRegisters(t *testing.T) {
+	for _, kind := range []string{"hash", "short", "long", "commit", "put"} {
+		t.Run(kind, func(t *testing.T) {
+			a, u, _ := setup(t)
+			ctx := context.Background()
+			b := []byte("hello")
+			if kind == "put" {
+				b = bytes.Repeat([]byte("a"), int(modelscope.InlineLimit)+1)
+				u.validateURL = "https://test.aliyuncs.com/upload"
+				u.failPut = true
+			}
+			f := file(b, 0)
+			input := b
+			switch kind {
+			case "hash":
+				input = []byte("wrong")
+			case "short":
+				input = b[:3]
+			case "long":
+				input = append(input, '!')
+			case "commit":
+				u.failCommit = true
+			}
+			_, e := a.Upload(ctx, f, bytes.NewReader(input))
+			if e == nil {
+				t.Fatal("expected failure")
+			}
+			if _, e = a.S.Get(ctx, f.Hash); !errors.Is(e, store.ErrMissing) {
+				t.Fatal("registered failed upload")
+			}
+			if kind == "commit" {
+				if e = a.S.Release(ctx); e == nil {
+					t.Fatal("released uncertain owner")
+				}
+				if _, e = a.Upload(ctx, f, bytes.NewReader(b)); !errors.Is(e, ErrBusy) {
+					t.Fatal("uncertain commit was retried")
+				}
+			} else if u.commits != 0 {
+				t.Fatal("committed unverified bytes")
+			}
+		})
+	}
+}
+func TestLargeStreamingReuseAndUpload(t *testing.T) {
+	for _, target := range []string{"", "https://x.aliyuncs.com/put"} {
+		t.Run(target, func(t *testing.T) {
+			a, u, _ := setup(t)
+			u.validateURL = target
+			b := bytes.Repeat([]byte("b"), int(modelscope.InlineLimit)+123)
+			f := file(b, 0)
+			if _, e := a.Upload(context.Background(), f, bytes.NewReader(b)); e != nil {
+				t.Fatal(e)
+			}
+			if len(u.content) != 0 || u.commits != 1 {
+				t.Fatal("large content buffered or not committed")
+			}
+			if target != "" && u.puts != 1 {
+				t.Fatal("not proxied")
+			}
+		})
+	}
+}
+func TestCodeConflictTTLAndMissing(t *testing.T) {
+	a, _, mr := setup(t)
+	ctx := context.Background()
+	b := []byte("code")
+	f := file(b, a.Now().Unix()+3600)
+	if _, e := a.NewCode(ctx, f.Hash, 0); !errors.Is(e, store.ErrMissing) {
+		t.Fatal(e)
+	}
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	a.Generate = func(mixed bool) string {
+		if mixed {
+			return "ab12CD"
+		}
+		return "000001"
+	}
+	c, e := a.NewCode(ctx, f.Hash, 0)
+	if e != nil || c.Code != "000001" || c.ExpiresAt != f.ExpiresAt {
+		t.Fatal(c, e)
+	}
+	c, e = a.NewCode(ctx, f.Hash, 0)
+	if e != nil || c.Code != "ab12CD" {
+		t.Fatal(c, e)
+	}
+	if _, e = a.Resolve(ctx, c.Code); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = a.NewCode(ctx, f.Hash, f.ExpiresAt); !errors.Is(e, ErrInvalid) {
+		t.Fatal("equal custom expiry accepted")
+	}
+	mr.FastForward(time.Hour)
+	if _, e = a.Resolve(ctx, c.Code); !errors.Is(e, store.ErrMissing) {
+		t.Fatal("code TTL")
+	}
+	if _, e = a.S.Get(ctx, f.Hash); e != nil {
+		t.Fatal("file metadata expired with TTL")
+	}
+}
+func TestCleanupRetryAndNoEarlyDelete(t *testing.T) {
+	a, u, _ := setup(t)
+	ctx := context.Background()
+	b := []byte("expire")
+	f := file(b, a.Now().Unix()+1)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	if e := a.Cleanup(ctx); e != nil || u.deletes != 0 {
+		t.Fatal("early cleanup")
+	}
+	now := a.Now().Unix() + 2
+	a.Now = func() time.Time { return time.Unix(now, 0) }
+	u.failDelete = true
+	if e := a.Cleanup(ctx); e == nil {
+		t.Fatal("cleanup failure missing")
+	}
+	if _, e := a.S.Get(ctx, f.Hash); e != nil {
+		t.Fatal("metadata lost")
+	}
+	if _, e := a.NewCode(ctx, f.Hash, 0); !errors.Is(e, ErrBusy) {
+		t.Fatal("pending deletion usable")
+	}
+	f.ExpiresAt = 0
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); !errors.Is(e, ErrBusy) {
+		t.Fatal("renewal bypassed pending deletion")
+	}
+	u.failDelete = false
+	now += 61
+	if e := a.Cleanup(ctx); e != nil {
+		t.Fatal(e)
+	}
+	if u.deletes != 2 {
+		t.Fatal("not retried")
+	}
+	if _, e := a.S.Get(ctx, f.Hash); !errors.Is(e, store.ErrMissing) {
+		t.Fatal("file retained")
+	}
+	if e := a.S.Release(ctx); e != nil {
+		t.Fatal("resolved deletion retained owner", e)
+	}
+}
+func TestRenewalSerializesWithDelete(t *testing.T) {
+	a, u, _ := setup(t)
+	ctx := context.Background()
+	b := []byte("race")
+	f := file(b, a.Now().Unix()+1)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	now := a.Now().Unix() + 2
+	a.Now = func() time.Time { return time.Unix(now, 0) }
+	u.deleteEntered = make(chan struct{}, 1)
+	u.deleteRelease = make(chan struct{})
+	clean := make(chan error, 1)
+	go func() { clean <- a.Cleanup(ctx) }()
+	<-u.deleteEntered
+	f.ExpiresAt = 0
+	up := make(chan error, 1)
+	go func() { _, e := a.Upload(ctx, f, bytes.NewReader(b)); up <- e }()
+	select {
+	case <-up:
+		t.Fatal("renewal raced past in-flight deletion")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(u.deleteRelease)
+	if e := <-clean; e != nil {
+		t.Fatal(e)
+	}
+	if e := <-up; e != nil {
+		t.Fatal(e)
+	}
+	got, e := a.Resolve(ctx, f.Hash)
+	if e != nil || got.ExpiresAt != 0 || u.commits != 2 {
+		t.Fatal("renewal lost", got, e)
+	}
+}
+func TestDirectRequiresUploadedBlob(t *testing.T) {
+	a, u, _ := setup(t)
+	a.C.UploadMode = "direct"
+	ctx := context.Background()
+	b := bytes.Repeat([]byte("d"), int(modelscope.InlineLimit)+1)
+	f := file(b, 0)
+	u.validateURL = "https://x.aliyuncs.com/put"
+	prepared, e := a.Prepare(ctx, f)
+	if e != nil {
+		t.Fatal(e)
+	}
+	id := prepared["session_id"].(string)
+	if _, e = a.Complete(ctx, id); !errors.Is(e, ErrInvalid) {
+		t.Fatal("unuploaded blob accepted")
+	}
+	u.validateURL = ""
+	if _, e = a.Complete(ctx, id); e != nil {
+		t.Fatal(e)
+	}
+	if u.commits != 1 {
+		t.Fatal("not committed")
+	}
+}
+func TestHTTPLifecycleSmoke(t *testing.T) {
+	a, _, _ := setup(t)
+	life := &Lifecycle{}
+	server := httptest.NewServer(life.Wrap(a.Handler(fstest.MapFS{"index.html": {Data: []byte("<title>文件柜</title>")}})))
+	defer server.Close()
+	client := server.Client()
+	b := []byte("smoke")
+	f := file(b, 0)
+	req, _ := http.NewRequest("PUT", server.URL+"/api/files/"+f.Hash+"?size=5&name=smoke.txt", bytes.NewReader(b))
+	resp, e := client.Do(req)
+	if e != nil {
+		t.Fatal(e)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 201 {
+		t.Fatal(resp.Status)
+	}
+	resp, e = client.Get(server.URL + "/api/files/" + f.Hash)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var lookup map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&lookup)
+	resp.Body.Close()
+	if lookup["download_url"] != "/api/download/"+f.Hash {
+		t.Fatal(lookup)
+	}
+	resp, e = client.Get(server.URL + "/api/download/" + f.Hash)
+	if e != nil {
+		t.Fatal(e)
+	}
+	download, e := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if e != nil || !bytes.Equal(download, b) || resp.Header.Get("Content-Disposition") == "" {
+		t.Fatal("download smoke", e)
+	}
+	resp, e = client.Post(server.URL+"/api/codes", "application/json", strings.NewReader(`{"hash":"`+f.Hash+`"}`))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if resp.StatusCode != 201 {
+		t.Fatal(resp.Status)
+	}
+	resp.Body.Close()
+	for _, path := range []string{"/", "/healthz", "/api/config"} {
+		resp, e = client.Get(server.URL + path)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if resp.StatusCode != 200 {
+			t.Fatal(path, resp.Status)
+		}
+		resp.Body.Close()
+	}
+	req, _ = http.NewRequest("PUT", server.URL+"/api/files/"+f.Hash+"?size=5", bytes.NewReader(b))
+	req.Header.Set("Origin", "https://evil.example")
+	resp, e = client.Do(req)
+	if e != nil {
+		t.Fatal(e)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 403 {
+		t.Fatal("cross-origin accepted")
+	}
+	life.Stop()
+	life.Wait()
+	resp, e = client.Get(server.URL + "/healthz")
+	if e != nil {
+		t.Fatal(e)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatal("shutdown admission")
+	}
+	if e = a.S.Release(context.Background()); e != nil {
+		t.Fatal(e)
+	}
+}
+func TestLifecycleDrains(t *testing.T) {
+	life := &Lifecycle{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	h := life.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { close(entered); <-release }))
+	go h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
+	<-entered
+	life.Stop()
+	done := make(chan struct{})
+	go func() { life.Wait(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("did not drain")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	<-done
+}
+func TestRedisFailureFailsClosed(t *testing.T) {
+	a, u, mr := setup(t)
+	mr.SetError("redis down")
+	b := []byte("bad")
+	if _, e := a.Upload(context.Background(), file(b, 0), bytes.NewReader(b)); e == nil {
+		t.Fatal("redis failure ignored")
+	}
+	if u.commits != 0 {
+		t.Fatal("upstream mutated")
+	}
+}
+
+func TestUncertainDeleteQuarantinesWithoutRetry(t *testing.T) {
+	a, u, _ := setup(t)
+	ctx := context.Background()
+	b := []byte("uncertain")
+	f := file(b, a.Now().Unix()+1)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	now := a.Now().Unix() + 2
+	a.Now = func() time.Time { return time.Unix(now, 0) }
+	u.uncertainDelete = true
+	if e := a.Cleanup(ctx); !errors.Is(e, modelscope.ErrUncertainMutation) {
+		t.Fatal(e)
+	}
+	p, e := a.S.Pending(ctx, f.Hash)
+	if e != nil || p != "delete-uncertain" {
+		t.Fatal(p, e)
+	}
+	u.uncertainDelete = false
+	now += 100
+	if e := a.Cleanup(ctx); e != nil {
+		t.Fatal(e)
+	}
+	if u.deletes != 1 {
+		t.Fatal("retried uncertain deletion")
+	}
+	if e := a.S.Release(ctx); e == nil {
+		t.Fatal("released unknown delete owner")
+	}
+	f.ExpiresAt = 0
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); !errors.Is(e, ErrBusy) {
+		t.Fatal("renewed over unknown delete")
+	}
+	if !a.Uncertain.Load() {
+		t.Fatal("shutdown did not retain claim")
+	}
+}
+
+func TestShortCodeExpiresWhileWaitingForLock(t *testing.T) {
+	a, _, _ := setup(t)
+	ctx := context.Background()
+	b := []byte("code-lock")
+	f := file(b, 0)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	c, e := a.NewCode(ctx, f.Hash, a.Now().Unix()+1)
+	if e != nil {
+		t.Fatal(e)
+	}
+	unlock, e := a.lock(ctx, f.Hash)
+	if e != nil {
+		t.Fatal(e)
+	}
+	// Deterministic clock advances on each lookup after the first read of code validity.
+	var calls atomic.Int64
+	now := a.Now().Unix()
+	a.Now = func() time.Time {
+		if calls.Add(1) == 1 {
+			return time.Unix(now, 0)
+		}
+		return time.Unix(now+2, 0)
+	}
+	result := make(chan error, 1)
+	go func() { _, err := a.Resolve(ctx, c.Code); result <- err }()
+	unlock()
+	if e := <-result; !errors.Is(e, store.ErrMissing) {
+		t.Fatal("expired code passed lock", e)
+	}
+}
+
+// Run a clock change after Redis has actually completed the file save transaction.
+type afterSaveHook struct{ after func() }
+
+func (h afterSaveHook) DialHook(next redis.DialHook) redis.DialHook {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) { return next(ctx, network, addr) }
+}
+func (h afterSaveHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+func (h afterSaveHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		err := next(ctx, cmds)
+		if err == nil {
+			for _, cmd := range cmds {
+				if cmd.Name() == "set" && strings.Contains(fmt.Sprint(cmd.Args()[1]), "file:") {
+					h.after()
+					break
+				}
+			}
+		}
+		return err
+	}
+}
+func TestUploadExpiryAfterCommitAndSave(t *testing.T) {
+	for _, mode := range []string{"proxy-new", "proxy-reuse", "direct-new", "direct-reuse"} {
+		for _, phase := range []string{"commit", "save"} {
+			if strings.HasSuffix(mode, "reuse") && phase == "commit" {
+				continue
+			}
+			t.Run(mode+"/"+phase, func(t *testing.T) {
+				a, u, _ := setup(t)
+				ctx := context.Background()
+				now := a.Now().Unix()
+				a.Now = func() time.Time { return time.Unix(now, 0) }
+				b := []byte("deadline")
+				if strings.HasPrefix(mode, "direct") {
+					a.C.UploadMode = "direct"
+					b = bytes.Repeat([]byte("x"), int(modelscope.InlineLimit)+1)
+				}
+				f := file(b, now+10)
+				if strings.HasSuffix(mode, "reuse") {
+					if err := a.S.Save(ctx, f); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if phase == "commit" {
+					u.afterCommit = func() { now = f.ExpiresAt }
+				} else {
+					a.S.R.AddHook(afterSaveHook{after: func() { now = f.ExpiresAt }})
+				}
+				var err error
+				if a.C.UploadMode == "direct" {
+					prepared, e := a.Prepare(ctx, f)
+					if e != nil {
+						t.Fatal(e)
+					}
+					_, err = a.Complete(ctx, prepared["session_id"].(string))
+				} else {
+					_, err = a.Upload(ctx, f, bytes.NewReader(b))
+				}
+				if !errors.Is(err, ErrInvalid) {
+					t.Fatal("expired upload reported success", err)
+				}
+				saved, e := a.S.Get(ctx, f.Hash)
+				if e != nil || saved.ExpiresAt != f.ExpiresAt {
+					t.Fatal("cleanup metadata lost", saved, e)
+				}
+				due, e := a.S.Due(ctx, now)
+				if e != nil || len(due) != 1 || due[0] != f.Hash {
+					t.Fatal("expiry index lost", due, e)
+				}
+				if p, e := a.S.Pending(ctx, f.Hash); e != nil || p != "" {
+					t.Fatal("confirmed commit wrongly quarantined", p, e)
+				}
+				if _, e := a.Resolve(ctx, f.Hash); !errors.Is(e, store.ErrMissing) {
+					t.Fatal("expired file served", e)
+				}
+				if e := a.Cleanup(ctx); e != nil || u.deletes != 1 {
+					t.Fatal("expired committed file not cleaned", e)
+				}
+			})
+		}
+	}
+}
+
+type apiTransport func(*http.Request) (*http.Response, error)
+
+func (f apiTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+func TestMalformedMutationKeepsJournal(t *testing.T) {
+	for _, body := range []string{`{}`, `null`, `{"Code":200,"Success":"true"}`, `{"Code":200,"Success":false}`, `{"Code":500,"Success":true}`} {
+		for _, action := range []string{"commit", "delete"} {
+			t.Run(action+body, func(t *testing.T) {
+				a, _, _ := setup(t)
+				ctx := context.Background()
+				c := modelscope.New(config.Config{Endpoint: "https://www.modelscope.cn", Repo: "o/r", RepoType: "models", Revision: "master"})
+				calls := 0
+				c.API.Transport = apiTransport(func(*http.Request) (*http.Response, error) {
+					calls++
+					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+				})
+				a.U = c
+				b := []byte("uncertain envelope")
+				f := file(b, a.Now().Unix()+1)
+				if action == "commit" {
+					if _, err := a.Upload(ctx, f, bytes.NewReader(b)); !errors.Is(err, modelscope.ErrUncertainMutation) {
+						t.Fatal(err)
+					}
+				} else {
+					if err := a.S.Save(ctx, f); err != nil {
+						t.Fatal(err)
+					}
+					a.Now = func() time.Time { return time.Unix(f.ExpiresAt+1, 0) }
+					if err := a.Cleanup(ctx); !errors.Is(err, modelscope.ErrUncertainMutation) {
+						t.Fatal(err)
+					}
+					if _, err := a.S.Get(ctx, f.Hash); err != nil {
+						t.Fatal("delete lost metadata", err)
+					}
+				}
+				want := "commit"
+				if action == "delete" {
+					want = "delete-uncertain"
+				}
+				if p, err := a.S.Pending(ctx, f.Hash); err != nil || p != want {
+					t.Fatal("journal lost", p, err)
+				}
+				if err := a.S.Release(ctx); err == nil {
+					t.Fatal("released uncertain owner")
+				}
+				f.ExpiresAt = 0
+				if _, err := a.Upload(ctx, f, bytes.NewReader(b)); !errors.Is(err, ErrBusy) {
+					t.Fatal("renewed uncertain mutation", err)
+				}
+				if calls != 1 {
+					t.Fatal("retried uncertain mutation", calls)
+				}
+			})
+		}
+	}
+}
+func TestDirectPrepareRefusesAuthenticatedLFS(t *testing.T) {
+	a, _, _ := setup(t)
+	a.C.UploadMode = "direct"
+	b := bytes.Repeat([]byte("x"), int(modelscope.InlineLimit)+1)
+	f := file(b, 0)
+	c := modelscope.New(config.Config{Endpoint: "https://www.modelscope.cn", Repo: "owner/repo", RepoType: "models", UploadMode: "direct", Token: "secret", UploadHosts: []string{".modelscope.cn"}})
+	c.API.Transport = apiTransport(func(*http.Request) (*http.Response, error) {
+		body := fmt.Sprintf(`{"Code":200,"Data":{"objects":[{"oid":%q,"size":%d,"actions":{"upload":{"href":%q,"offset":0,"upload_header":{"Range":"bytes=0-"},"upload_parameters":{}}}}]}}`, f.Hash, f.Size, "https://lfs.modelscope.cn/api/v1/repos/models/owner/repo/blobs/"+f.Hash+"/"+fmt.Sprint(f.Size))
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	a.U = c
+	body, _ := json.Marshal(f)
+	rr := httptest.NewRecorder()
+	a.Handler(fstest.MapFS{}).ServeHTTP(rr, httptest.NewRequest("POST", "/api/uploads/prepare", bytes.NewReader(body)))
+	if rr.Code != 422 || !strings.Contains(rr.Body.String(), "proxy") || strings.Contains(rr.Body.String(), "secret") || strings.Contains(rr.Body.String(), "upload_url") {
+		t.Fatal("unsafe direct response", rr.Code, rr.Body.String())
+	}
+	keys, e := a.S.R.Keys(context.Background(), a.S.Prefix+"session:*").Result()
+	if e != nil || len(keys) != 0 {
+		t.Fatal("unusable session created", keys, e)
+	}
+}
