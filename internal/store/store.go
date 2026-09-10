@@ -50,6 +50,28 @@ func (s *Store) Claim(ctx context.Context) error {
 	}
 	return nil
 }
+
+// ClaimOrReclaim attempts to claim storage ownership. If the durable owner key
+// exists but there are no pending mutations, the orphan lock is reclaimed safely.
+// Only the old owner could have set pending; if pending is empty, no mutate is in
+// flight and the existing owner is unreachable (crashed / SIGKILL).
+func (s *Store) ClaimOrReclaim(ctx context.Context) error {
+	ok, e := s.R.SetNX(ctx, s.Prefix+"owner", s.Owner, 0).Result()
+	if e != nil {
+		return e
+	}
+	if ok {
+		return nil
+	}
+	n, e := s.R.HLen(ctx, s.Prefix+"pending").Result()
+	if e != nil {
+		return e
+	}
+	if n > 0 {
+		return ErrOwner
+	}
+	return s.R.Set(ctx, s.Prefix+"owner", s.Owner, 0).Err()
+}
 func (s *Store) Check(ctx context.Context) error {
 	v, e := s.R.Get(ctx, s.Prefix+"owner").Result()
 	if e != nil {

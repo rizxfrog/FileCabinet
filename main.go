@@ -45,7 +45,7 @@ func run() error {
 	defer r.Close()
 	s := store.New(r, c.Prefix())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	e = s.Claim(ctx)
+	e = s.ClaimOrReclaim(ctx)
 	cancel()
 	if e != nil {
 		return fmt.Errorf("cannot claim storage ownership %s; check Redis connectivity and durable owner claim (README recovery)", c.Prefix())

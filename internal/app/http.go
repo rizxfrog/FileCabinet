@@ -44,7 +44,7 @@ func (l *Lifecycle) Wrap(next http.Handler) http.Handler {
 func (a *Service) Handler(assets fs.FS) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/config", func(w http.ResponseWriter, r *http.Request) {
-		reply(w, 200, map[string]any{"upload_mode": a.C.UploadMode, "max_upload_bytes": a.C.MaxBytes, "inline_limit": modelscope.InlineLimit})
+		reply(w, 200, map[string]any{"upload_mode": a.C.UploadMode, "max_upload_bytes": a.C.MaxBytes, "inline_limit": modelscope.InlineLimit, "unsafe_direct_expose_url": a.C.UnsafeDirectExposeURL})
 	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
@@ -166,11 +166,20 @@ func (a *Service) Handler(assets fs.FS) http.Handler {
 		}
 		files.ServeHTTP(w, r)
 	})
+	// Config validates host suffix syntax. CSP permits only HTTPS hosts accepted by
+	// the storage allowlist, and only when browser direct uploads are enabled.
+	connectSrc := "'self'"
+	if a.C.UploadMode == "direct" {
+		for _, suffix := range a.C.UploadHosts {
+			host := strings.TrimPrefix(suffix, ".")
+			connectSrc += " https://" + host + " https://*." + host
+		}
+	}
 	slots := make(chan struct{}, 16)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src "+connectSrc+"; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}

@@ -6,10 +6,10 @@
 
 - 浏览器在 Web Worker 中每次读取 4 MiB，增量计算 SHA-256，不将大文件整体载入内存。
 - 默认 `UPLOAD_MODE=proxy`。≤5 MiB 经后端校验并 base64 内联提交；更大文件由后端携带认证流式转发至精确校验的 ModelScope LFS 接口（或不带认证转发至真正的存储签名地址），校验实际大小与 SHA-256 后才提交。流量经过后端，内存不随大文件大小增长。上传连接失败不自动重放流。
-- `direct` 为未来 CLI / 原生客户端保留申请、直传、完成接口，但仅在上游返回真正的免 token 签名 URL 或 blob 已存在时可用。当前 ModelScope LFS 返回需认证的 API URL，申请新 blob 直传会明确拒绝（422），应使用 `proxy`。原生客户端不受 CORS 限制不等于免认证；浏览器大文件直传仍被 UI 禁止，小文件仍走内联接口。**不包含 CLI，不下发 ModelScope token，不提供“不安全 302”开关。**
+- `direct` 提供申请、直传、完成接口，浏览器可实验性尝试大文件直传，未来 CLI / 原生客户端也可复用；仅在上游返回真正的免 token 签名 URL 或 blob 已存在时可用。当前 ModelScope LFS 返回需认证的 API URL，申请新 blob 直传会明确拒绝（422），应使用 `proxy`。原生客户端不受 CORS 限制不等于免认证；浏览器需要上游允许 CORS（或仅在测试时使用 Allow CORS 插件），插件不解决鉴权，小文件仍走内联接口。**不包含 CLI，不下发 ModelScope token，不提供“不安全 302”开关。**
 - 文件默认永久；1h / 1d / 7d / 自定义绝对到期时间。重复内容只延长有效期，永久优先。proxy 重复上传仍读取并校验传入内容，避免声明 hash 绕过内容校验。
 - 六位数字短码；本次首次数字冲突后改试六位大小写字母与数字混合，Redis SET NX 原子占位。默认到期 `min(文件到期, 当前时间+7天)`；自定义必须未来且严格早于默认值。文件到期后不能生成/使用短码。
-- 下载查询返回本服务相对链接，后端携带凭证请求 ModelScope，跟随受限存储重定向时不携带凭证。公开和私有仓库统一使用下载代理，不依赖未经验证的签名下载 API。文件不会在页面公开列出。
+- 下载查询返回本服务相对链接，后端携带凭证请求 ModelScope，跟随受限存储重定向时不携带凭证。文件不会在页面公开列出。
 - 元数据无 TTL，Redis sorted set 保留清理任务；短码和直传会话才使用 TTL。每 30 秒清理最多 100 项，明确拒绝的失败后 60 秒重试；超时/5xx 等未知结果隔离待人工核对；同一文件的上传/续期/删除/下载在锁内串行。
 
 ## 先决条件与启动
@@ -73,6 +73,7 @@ Compose 的 Redis 开启 AOF、`appendfsync always`、`noeviction` 并持久化 
 | `MODELSCOPE_REPO_TYPE` | `datasets` 或 `models` |
 | `MODELSCOPE_REVISION` | `master`；**dataset 仅支持 master**，因为 SDK 的删除端点没有 Revision 参数；其他值启动报错。model 上传/下载/删除一致使用配置 revision |
 | `FILECABINET_NAMESPACE` | 两位数字，默认 `00` |
+| `UNSAFE_DIRECT_EXPOSE_URL` | 默认 `false`。仅用于 direct/CORS 实验；开启后会把上游上传 href 返回浏览器，但不会返回 token。此开关危险，测试后必须立即关闭；proxy 模式忽略。 |
 | `UPLOAD_MODE` | `proxy`（默认）/ `direct` |
 | `MAX_UPLOAD_BYTES` | 10 GiB，可调整；最大 2^50 字节 |
 | `TRANSFER_TIMEOUT` | `30m`，1 秒到 24 小时 |
@@ -103,7 +104,7 @@ hello
 
 需要短码时上传成功后调用 `POST /api/codes`。短码上限依据已保存文件的合并有效期，而不是本次请求的较短有效期。前端将“文件成功、短码失败”分别展示，不误报文件失败；取消短码阶段只中止等待，文件保留，服务端可能已经生成短码。
 
-### 原生客户端直传（仅 direct）
+### 实验性浏览器 / 原生客户端直传（仅 direct）
 
 ```http
 POST /api/uploads/prepare
@@ -116,9 +117,11 @@ Content-Type: application/json
 
 仅当返回真正的无额外认证要求、带查询参数的存储签名 URL，或 blob 已存在时，返回 `{session_id,upload_url,method:"PUT",expires_in:3600}`。仅支持 >5 MiB。会话有效期 1 小时；上游 URL 本身可能更早到期，URL 过期可重新申请。
 
-1. `upload_url` 非空：原生客户端对其 PUT 原始文件，正确设置 Content-Length，**不要添加 ModelScope token**。
+1. `upload_url` 非空：客户端对其 PUT 原始文件，原生客户端正确设置 Content-Length（浏览器自动设置），**不要添加 ModelScope token**。
 2. URL 为空：上游 blob 已存在，可以跳过 PUT。
 3. `POST /api/uploads/{session_id}/complete`：后端再次调用 batch API，只有确认该 blob 不再需要上传才提交并保存记录。
+
+浏览器在 hash 计算后执行上述三步，支持上传进度与各阶段取消；PUT 失败不会请求 complete。取消 complete 等待并不能撤回服务端提交，请通过 hash 查询最终结果；未完成的直传会话在 1 小时后过期。外部上传不携带 Cookie 或 Authorization；仅接受原始签名地址的成功响应，重定向响应不触发 complete。direct 模式的 CSP connect-src 只额外允许 `STORAGE_HOST_SUFFIXES` 中的 HTTPS 主域及子域，proxy 模式仍仅允许同源。浏览器可能在被允许的存储域间跟随重定向，因此这些域必须可信；不要扩大白名单来绕过未知错误。
 
 direct 不读取文件内容，依赖上游按 oid/size 验证 blob；不像 proxy 自行验证字节。会话 ID 是短时持有者凭证，不能公开。客户端声称完成不作为成功证据。不要在浏览器中尝试用重定向绕过 PUT CORS。
 

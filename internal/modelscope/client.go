@@ -192,11 +192,8 @@ func (c *Client) Validate(ctx context.Context, hash string, size int64) (string,
 				if !valid || len(a.Header) > 0 || len(a.UploadParameters) > 0 || a.Offset != 0 || (len(a.UploadHeader) > 0 && (len(a.UploadHeader) != 1 || a.UploadHeader["Range"] != "bytes=0-")) {
 					return "", ErrUpstream
 				}
-				if c.C.UploadMode == "direct" {
-					u, _ := url.Parse(a.Href)
-					if auth || u.RawQuery == "" {
-						return "", ErrDirectUnsupported
-					}
+				if c.C.UploadMode == "direct" && auth && !c.C.UnsafeDirectExposeURL {
+					return "", ErrDirectUnsupported
 				}
 				return a.Href, nil
 			}

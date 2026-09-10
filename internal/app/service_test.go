@@ -703,3 +703,26 @@ func TestDirectPrepareRefusesAuthenticatedLFS(t *testing.T) {
 		t.Fatal("unusable session created", keys, e)
 	}
 }
+
+func TestUploadModeCSP(t *testing.T) {
+	for _, mode := range []string{"proxy", "direct"} {
+		t.Run(mode, func(t *testing.T) {
+			a, _, _ := setup(t)
+			a.C.UploadMode = mode
+			a.C.UploadHosts = []string{".example.com", ".aliyuncs.com"}
+			rr := httptest.NewRecorder()
+			a.Handler(fstest.MapFS{"index.html": {Data: []byte("UI")}}).ServeHTTP(rr, httptest.NewRequest("GET", "/", nil))
+			csp := rr.Header().Get("Content-Security-Policy")
+			want := "connect-src 'self'"
+			if mode == "direct" {
+				want += " https://example.com https://*.example.com https://aliyuncs.com https://*.aliyuncs.com"
+			}
+			if !strings.Contains(csp, want+";") || strings.Contains(csp, " https:;") || strings.Contains(csp, "https://*") && mode == "proxy" {
+				t.Fatalf("unexpected CSP: %s", csp)
+			}
+			if !strings.Contains(csp, "frame-ancestors 'none'") || !strings.Contains(csp, "default-src 'self'") {
+				t.Fatal("unrelated CSP protections lost", csp)
+			}
+		})
+	}
+}
