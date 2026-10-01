@@ -201,7 +201,13 @@ func (c *Client) Validate(ctx context.Context, hash string, size int64) (string,
 			return "", nil
 		}
 	}
-	return "", ErrUpstream
+	// ModelScope omits the requested object from the batch reply when the blob is
+	// already stored (the official SDK documents the same: an oid absent from
+	// objects means "exists", with no separate flag). An empty list is a successful
+	// "nothing to upload", not a malformed reply. Returning "" makes callers skip the
+	// PUT and commit the pointer; a rewritten or mismatched upload action is still
+	// rejected strictly above.
+	return "", nil
 }
 func (c *Client) Put(ctx context.Context, raw, hash string, r io.Reader, size int64) error {
 	auth, valid := c.uploadTarget(raw, hash, size)

@@ -122,9 +122,30 @@ func TestWireProtocol(t *testing.T) {
 		})
 	}
 }
+func TestValidateTreatsOmittedObjectAsStored(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	// Real upstream/shape: ModelScope replies 200 with the object missing from
+	// "objects" when the blob is already stored. The SDK documents the same
+	// contract (href None = blob exists), so this must not be an error.
+	for _, body := range []string{
+		`{"Code":200,"Success":true,"Message":"success","Data":{"objects":[],"reused-objects":[]}}`,
+		`{"Code":200,"Success":true,"Message":"success","Data":{"objects":[],"reused-objects":[{"oid":"` + hash + `"}]}}`,
+	} {
+		c := New(config.Config{Endpoint: "https://example.com", Repo: "o/r", RepoType: "datasets", Revision: "master", UploadHosts: []string{".aliyuncs.com"}})
+		c.API = &http.Client{Transport: transport(func(*http.Request) (*http.Response, error) { return response(body), nil })}
+		target, e := c.Validate(context.Background(), hash, 351939402)
+		if e != nil {
+			t.Fatalf("omitted object must mean already stored, got %v for %s", e, body)
+		}
+		if target != "" {
+			t.Fatalf("stored blob must not return an upload target, got %q", target)
+		}
+	}
+}
+
 func TestValidateFailsClosed(t *testing.T) {
 	hash := strings.Repeat("f", 64)
-	for _, body := range []string{`{}`, `{"Code":500,"Data":{}}`, `{"Success":false}`, `{"objects":[]}`, `{"objects":[{"oid":"` + hash + `","error":{"code":404}}]}`, `{"objects":[{"oid":"` + hash + `","actions":{"upload":{"href":"http://127.0.0.1/x"}}}]}`, `{"objects":[{"oid":"` + hash + `","actions":{"upload":{"href":"https://bucket.aliyuncs.com/x","header":{"Authorization":"secret"}}}}]}`} {
+	for _, body := range []string{`{}`, `{"Code":500,"Data":{}}`, `{"Success":false}`, `{"objects":[{"oid":"` + hash + `","error":{"code":404}}]}`, `{"objects":[{"oid":"` + hash + `","actions":{"upload":{"href":"http://127.0.0.1/x"}}}]}`, `{"objects":[{"oid":"` + hash + `","actions":{"upload":{"href":"https://bucket.aliyuncs.com/x","header":{"Authorization":"secret"}}}}]}`} {
 		c := New(config.Config{Endpoint: "https://example.com", Repo: "o/r", RepoType: "models", UploadHosts: []string{".aliyuncs.com"}})
 		c.API = &http.Client{Transport: transport(func(*http.Request) (*http.Response, error) { return response(body), nil })}
 		if _, e := c.Validate(context.Background(), hash, 1); e == nil {
