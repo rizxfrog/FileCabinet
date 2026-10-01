@@ -80,7 +80,22 @@ Compose 的 Redis 开启 AOF、`appendfsync always`、`noeviction` 并持久化 
 | `TRANSFER_TIMEOUT` | `30m`，1 秒到 24 小时 |
 | `STORAGE_HOST_SUFFIXES` | `.modelscope.cn,.aliyuncs.com,.amazonaws.com`；仅接受这些边界明确的 HTTPS 主机、443 端口、公共 IP；管理员可添加经过验证的域名。不要放宽为 `.com` |
 
-存储路径：`namespace/hash[:2]/hash[2:]`。Redis key 前缀是 endpoint/repo type/repo/revision/namespace 的摘要，避免不同存储混用。
+存储路径：`namespace/hash[:2]/hash[2:]`；文件名等元数据由服务写入同一提交的 `namespace/meta/hash[:2]/hash[2:].json`。Redis key 前缀是 endpoint/repo type/repo/revision/namespace 的摘要，避免不同存储混用。
+
+### 文件元数据（meta）
+
+每个文件在提交时同时写入一个文本 meta 文件，与 blob 指针在同一次 commit 中落地，因此不会出现"文件可见但没有文件名"的中间态：
+
+```text
+00/meta/ac/ac3c56ad1d336649b38b4ced877e1f45ef6d78cf1d62feba56c991db93b63b24.json
+{"file_name":"高等数学1.zip","size":351939402}
+```
+
+- **名字的权威来源是仓库**：`GET /api/files/{key}` 与下载都会读取 meta 并把其中的 `file_name` 作为对外文件名，Redis 中的 `name` 仅作回退（meta 缺失、读取失败或字段非法时沿用）。读取失败不会让文件不可用。
+- **`size` 必填**，既是重建记录所需，也是"这确实是 FileCabinet 文档"的标记：路径上凑巧存在的其他 JSON 不会被当成元数据采用；`file_name` 非法（含 `/`、`\`、CR/LF/NUL 或超过 255 字节）时只丢弃名字、回退为 hash，文件仍可下载。
+- **Redis 记录丢失后可重建**：hash 是内容寻址的，meta 路径可由 hash 推导。当 Redis 无该文件记录时，服务读取 meta 恢复 `name`/`size` 并允许查询与下载。此时 **`expires_at` 为 0（视为永久）**：到期时间是 Redis 独有的信息，无法从仓库恢复，需要重新上传才能恢复原有效期。未持有 hash 的调用方无法枚举此路径。
+- **清理会一并删除 meta**；若 meta 尚不存在而被删（例如升级前入库的文件），只删除 blob。
+- 后续可在同一文档中扩展字段（未知字段在读取时被忽略），因此新增元数据不需要改动旧记录。
 
 ## API
 
@@ -194,6 +209,7 @@ ModelScope mutation API 没有 fencing token，Redis 有 TTL 的锁不能阻止�
 - 存储转发地址只来自经过认证的 ModelScope 响应，不接受客户端传入目标 URL。存储连接二次解析/固定公共 IP，禁用环境 HTTP 代理与自动重定向，凭证仅发给配置的 ModelScope API origin，以及精确匹配 `https://lfs.modelscope.cn` + 配置仓库类型/ID + 预期 SHA-256/大小的标准上传路径。LFS 上传 URL 必须无查询、转义变体或片段，仓库/oid/size 任一不匹配即拒绝；其他 `.modelscope.cn` 上传路径也拒绝。存储域名后缀白名单绝不授权附加 token，OSS 与所有下载重定向均不带认证。白名单外地址、非 HTTPS、未知上传 headers/parameters 或非零 offset 返回错误，不静默降级。已知 batch 的 `upload_header: {"Range":"bytes=0-"}` 是完整上传提示，SDK 同样不依赖传递该 header。**batch 响应里缺失所请求的对象（`objects` 为空或未含该 oid）表示上游已存有该 blob**，官方 SDK 的语义相同（返回映射中 `None` 即“已存在”）；此时服务端跳过 PUT、直接提交指针，空列表不算畸形响应。实测上游按 oid/size 精确记忆（对同一 blob 用错误 size 询问会重新返回上传地址），因此该结果只构成“可跳过 PUT、交由上游按 oid/size 校验”的证据，不能用作本地存在性探测或内容校验——`VALIDATE` 的这条分支不覆盖被篡改的短码所指 blob，也不代表 size 一定正确。下载 `direct` 下返回的 302 目标同样过 `SafeStorageURL` 白名单，且路径必须包含该文件的完整 hash（路径里的 `/` 先去除，因上游把 hash 拆成 `/89/6f/…`），否则不跳转；`namespace`/`repository`/`revision`/`tag` 等仓库探测参数会被移除，`filename` 经净化后写入（不覆盖签名，但它是上游 `Content-Disposition` 的回显位）。
 - 文件过期会尽快从当前仓库树删除；**Git 历史提交、LFS 全局 blob、存储侧缓存可能仍保留内容**。删除不等于不可恢复的物理擦除。文件 hash 或持有的上游签名 URL 不支持撤销；严格数据销毁需求不适合此后端。`DOWNLOAD_MODE=direct` 会主动把这类签名 URL 交给客户端：签发后到 `auth_key` 过期（实测 ≥20 分钟）前，无法通过到期/短码/清理或任何本地手段收回，也不要指望上游支持撤销。
 - 停机期间过期任务保留，恢复后执行；删除失败文件立即逻辑不可访问，物理删除会延迟。已发出的字节/链接无法收回。
+- **上游删除接口已变更**：ModelScope 的 `DELETE .../repo` 现在返回 `400 the current token no longer supports deletion operations`，因此删除改为 commit `{"action":"delete"}`。上游对含不存在路径的 commit 会整包拒绝（`commit rejected by repository policy`），故删除前先探测存在性，只提交仍存在的路径；两者都不存在时视为已达成目标状态。探测器失败返回 `ErrUpstream`（可重试，未产生变更），提交阶段的不确定结果仍按 `ErrUncertainMutation` 隔离。
 - 不自动创建仓库，不扫描重建 Redis；Redis 备份不可省略。ModelScope 对私有仓库的具体权限、API 变动、域名及服务配额需实际环境联调。
 
 ## 验证

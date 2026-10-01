@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,8 +28,9 @@ var ErrBusy = errors.New("文件操作结果待确认，暂不可使用；请联
 type Upstream interface {
 	Validate(context.Context, string, int64) (string, error)
 	Put(context.Context, string, string, io.Reader, int64) error
-	Commit(context.Context, string, string, int64, []byte) error
-	Delete(context.Context, string) error
+	Commit(context.Context, string, string, string, int64, []byte, []byte) error
+	Delete(context.Context, string, string) error
+	ReadFile(context.Context, string) ([]byte, error)
 	Download(context.Context, string) (*http.Response, error)
 	DownloadTarget(context.Context, string, string, string) (string, *http.Response, error)
 }
@@ -59,8 +61,74 @@ func (a *Service) lock(ctx context.Context, h string) (func(), error) {
 		return nil, ctx.Err()
 	}
 }
-func HashValid(h string) bool             { return regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(h) }
-func (a *Service) Path(h string) string   { return a.C.Namespace + "/" + h[:2] + "/" + h[2:] }
+func HashValid(h string) bool           { return regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(h) }
+func (a *Service) Path(h string) string { return a.C.Namespace + "/" + h[:2] + "/" + h[2:] }
+
+// MetaPath is the repository-committed metadata document for a hash. It sits beside
+// the blob under the same namespace, so a shared repository never mixes namespaces and
+// cleanup can address the pair symmetrically.
+func (a *Service) MetaPath(h string) string {
+	return a.C.Namespace + "/meta/" + h[:2] + "/" + h[2:] + ".json"
+}
+
+// fileMeta is the committed record. It is intentionally minimal and forward compatible:
+// unknown fields in a stored document are ignored, and FileName is the only field today.
+// Size has no omitempty: it is also the marker that distinguishes a real document from
+// arbitrary bytes served at the same path, so an empty file must still record 0.
+type fileMeta struct {
+	FileName string `json:"file_name"`
+	Size     int64  `json:"size"`
+}
+
+// metaFor encodes the meta document written alongside the blob. Only a name that passed
+// ValidateFile is stored; a name equal to the hash means "no name was supplied".
+func metaFor(f store.File) []byte {
+	m := fileMeta{Size: f.Size}
+	if f.Name != "" && f.Name != f.Hash {
+		m.FileName = f.Name
+	}
+	b, e := json.Marshal(m)
+	if e != nil {
+		return nil
+	}
+	return b
+}
+
+// parseMeta decodes a committed meta document. ok is false when the bytes are not a
+// FileCabinet document at all, which keeps an unrelated repository file from being
+// mistaken for metadata.
+func parseMeta(b []byte) (name string, size int64, ok bool) {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(b, &raw) != nil {
+		return "", 0, false
+	}
+	if _, present := raw["size"]; !present {
+		return "", 0, false
+	}
+	var m fileMeta
+	if json.Unmarshal(b, &m) != nil || m.Size < 0 {
+		return "", 0, false
+	}
+	if !validName(m.FileName) {
+		return "", m.Size, true
+	}
+	return m.FileName, m.Size, true
+}
+
+func validName(name string) bool {
+	return name != "" && len(name) <= 255 && utf8.ValidString(name) && !strings.ContainsAny(name, "\r\n\x00/\\")
+}
+
+// metaName reads the committed name for a hash. Absence, a truncated document or a
+// decode failure all yield "" so callers keep the name they already have.
+func (a *Service) metaName(ctx context.Context, h string) string {
+	b, e := a.U.ReadFile(ctx, a.MetaPath(h))
+	if e != nil || len(b) == 0 {
+		return ""
+	}
+	name, _, _ := parseMeta(b)
+	return name
+}
 func active(f store.File, now int64) bool { return f.ExpiresAt == 0 || f.ExpiresAt > now }
 func MergeExpiry(old, new int64) int64 {
 	if old == 0 || new == 0 {
@@ -202,7 +270,7 @@ func (a *Service) commitLocked(ctx context.Context, f store.File, content []byte
 		a.Uncertain.Store(true)
 		return f, e
 	}
-	if e := a.U.Commit(ctx, a.Path(f.Hash), f.Hash, f.Size, content); e != nil {
+	if e := a.U.Commit(ctx, a.Path(f.Hash), a.MetaPath(f.Hash), f.Hash, f.Size, content, metaFor(f)); e != nil {
 		return f, e
 	}
 	if e := a.S.Save(ctx, f); e != nil {
@@ -216,7 +284,7 @@ func (a *Service) deleteLocked(ctx context.Context, f store.File) error {
 		a.Uncertain.Store(true)
 		return e
 	}
-	if e := a.U.Delete(ctx, a.Path(f.Hash)); e != nil {
+	if e := a.U.Delete(ctx, a.Path(f.Hash), a.MetaPath(f.Hash)); e != nil {
 		state := "delete"
 		if errors.Is(e, modelscope.ErrUncertainMutation) || errors.Is(e, context.DeadlineExceeded) || errors.Is(e, context.Canceled) {
 			state = "delete-uncertain"
@@ -264,10 +332,45 @@ func (a *Service) Resolve(ctx context.Context, key string) (store.File, error) {
 		return store.File{}, e
 	}
 	f, e := a.S.Get(ctx, h)
-	if e == nil && !active(f, a.Now().Unix()) {
-		e = store.ErrMissing
+	if e != nil {
+		if !errors.Is(e, store.ErrMissing) {
+			return store.File{}, e
+		}
+		return a.recover(ctx, h)
 	}
-	return f, e
+	if !active(f, a.Now().Unix()) {
+		return store.File{}, store.ErrMissing
+	}
+	// The committed meta document is the durable source of the name; Redis carries the
+	// authoritative lifetime. A failing meta read must not make the file unavailable.
+	if name := a.metaName(ctx, h); name != "" {
+		f.Name = name
+	}
+	return f, nil
+}
+
+// recover reconstructs a record when Redis has no entry for the hash, using the meta
+// document committed beside the blob. It is limited to files this service committed:
+// the document must parse as a FileCabinet meta record, which keeps an unrelated
+// repository file at the same path from being adopted. Whether the blob still exists is
+// decided by the caller's subsequent download, so a dangling document cannot fabricate
+// an available file.
+//
+// The returned record has no expiry: Redis held the only copy of that deadline, so the
+// file is treated as permanent until the upload is repeated.
+func (a *Service) recover(ctx context.Context, h string) (store.File, error) {
+	b, e := a.U.ReadFile(ctx, a.MetaPath(h))
+	if e != nil {
+		return store.File{}, e
+	}
+	name, size, ok := parseMeta(b)
+	if !ok || size > a.C.MaxBytes {
+		return store.File{}, store.ErrMissing
+	}
+	if name == "" {
+		name = h
+	}
+	return store.File{Hash: h, Name: name, Size: size}, nil
 }
 func (a *Service) NewCode(ctx context.Context, h string, expiry int64) (store.Code, error) {
 	var c store.Code
@@ -522,19 +625,25 @@ func (a *Service) DirectDownload(ctx context.Context, key string) (store.File, s
 // the per-hash lock, verify the owner claim, the pending journal, the file expiry
 // and the short-code validity. The caller owns the returned unlock function.
 func (a *Service) authorize(ctx context.Context, key string) (store.File, func(), error) {
-	f, e := a.Resolve(ctx, key)
+	resolved, e := a.Resolve(ctx, key)
 	if e != nil {
-		return f, nil, e
+		return resolved, nil, e
 	}
-	unlock, e := a.lock(ctx, f.Hash)
+	unlock, e := a.lock(ctx, resolved.Hash)
 	if e != nil {
-		return f, nil, e
+		return resolved, nil, e
 	}
-	if e = a.ready(ctx, f.Hash); e != nil {
+	if e = a.ready(ctx, resolved.Hash); e != nil {
 		unlock()
-		return f, nil, e
+		return resolved, nil, e
 	}
-	f, e = a.S.Get(ctx, f.Hash)
+	// Re-read under the lock: the lock serializes against cleanup, so a missing record
+	// here means none exists rather than one being removed. The record Resolve produced
+	// stays valid, which is what keeps a meta-recovered file downloadable.
+	f, e := a.S.Get(ctx, resolved.Hash)
+	if errors.Is(e, store.ErrMissing) {
+		f, e = resolved, nil
+	}
 	if e != nil || !active(f, a.Now().Unix()) {
 		unlock()
 		if e == nil {

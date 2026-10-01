@@ -8,6 +8,11 @@ compiled into the same binary. Module `FileCabinet`, Go 1.24.
 
 - Key = SHA-256 of file content. Clients compute the hash; the service stores bytes
   under `namespace/<hash[:2]>/<hash[2:]>` in a configured ModelScope repo.
+- Each file also gets a committed JSON metadata document at
+  `namespace/meta/<hash[:2]>/<hash[2:]>.json` holding `file_name` and `size`. It is
+  written in the same commit as the blob pointer, is the authoritative source of the
+  name on read, and lets a lookup rebuild a record when the Redis entry is gone
+  (recovered records have no expiry).
 - Metadata, short codes, expiry index and upload sessions live in Redis; Redis also
   gates single-instance ownership.
 - Two modes per direction: `UPLOAD_MODE` and `DOWNLOAD_MODE`, each `proxy` (default,
@@ -106,6 +111,11 @@ automatically, so run `gofmt -l .` and `go vet ./...` manually before yielding.
 - **Uncertainty**: transport failures and ambiguous upstream envelopes map to
   `ErrUncertainMutation`, never to a clean error; the journal entry is kept and the
   mutation is never auto-retried.
+- **Upstream delete**: the `DELETE .../repo` endpoint now answers 400 ("token no longer
+  supports deletion operations"), so deletion commits minimal `{"action":"delete","path":…}`
+  actions instead. ModelScope rejects a commit containing a path absent from the
+  revision, so existence is probed first and absent paths are skipped; a failed probe is
+  `ErrUpstream` (safe to retry, nothing mutated).
 - **Context**: first parameter on every I/O method. Where a journal write must survive
   cancellation, use `context.WithoutCancel(ctx)` with a short timeout.
 - **Concurrency**: in-process per-hash lock is `[256]chan struct{}` indexed by the first

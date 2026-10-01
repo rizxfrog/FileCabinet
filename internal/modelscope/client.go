@@ -22,6 +22,10 @@ import (
 
 const InlineLimit int64 = 5 * 1024 * 1024
 
+// metaLimit caps a repository metadata read. Meta documents are tiny JSON; the bound
+// keeps a wrong or hostile path from streaming an arbitrary repository file.
+const metaLimit int64 = 64 << 10
+
 var ErrDirectUnsupported = errors.New("上游上传地址需要服务端认证，不支持免 token 直传；请使用 UPLOAD_MODE=proxy")
 
 var ErrUpstream = errors.New("ModelScope 请求失败，请稍后重试或联系管理员")
@@ -251,7 +255,57 @@ func (c *Client) Put(ctx context.Context, raw, hash string, r io.Reader, size in
 	}
 	return nil
 }
-func (c *Client) Commit(ctx context.Context, path, hash string, size int64, content []byte) error {
+
+// ReadFile fetches a repository file's raw bytes. A path absent from the revision
+// yields (nil, nil): absence is a normal outcome for metadata that outlived its blob,
+// not an error.
+//
+// The API answers 302 to storage for a readable file, so redirects are followed here
+// the same way Download does: only to allowlisted storage hosts, without credentials,
+// and bounded.
+func (c *Client) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	q := url.Values{"Revision": {c.C.Revision}, "FilePath": {path}}
+	req, e := http.NewRequestWithContext(ctx, "GET", c.path(c.C.RepoType+"/"+c.C.Repo+"/repo")+"?"+q.Encode(), nil)
+	if e != nil {
+		return nil, ErrUpstream
+	}
+	c.auth(req)
+	resp, e := c.API.Do(req)
+	if e != nil {
+		return nil, ErrUpstream
+	}
+	for n := 0; n < 5 && resp.StatusCode >= 300 && resp.StatusCode < 400; n++ {
+		loc, err := resp.Location()
+		resp.Body.Close()
+		if err != nil || !c.SafeStorageURL(loc.String()) {
+			return nil, ErrUpstream
+		}
+		// Storage never receives the ModelScope credential.
+		req, err = http.NewRequestWithContext(ctx, "GET", loc.String(), nil)
+		if err != nil {
+			return nil, ErrUpstream
+		}
+		if resp, e = c.Storage.Do(req); e != nil {
+			return nil, ErrUpstream
+		}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		return nil, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, ErrUpstream
+	}
+	b, e := io.ReadAll(io.LimitReader(resp.Body, metaLimit+1))
+	if e != nil || int64(len(b)) > metaLimit {
+		return nil, ErrUpstream
+	}
+	return b, nil
+}
+
+// Commit writes the blob pointer and, when metaPath is set, the meta file in a single
+// commit, so a stored file never becomes visible without its metadata.
+func (c *Client) Commit(ctx context.Context, path, metaPath, hash string, size int64, content, meta []byte) error {
 	op := map[string]any{"action": "create", "path": path, "type": "lfs", "size": size, "sha256": hash, "content": "", "encoding": ""}
 	if size <= InlineLimit {
 		op["type"] = "normal"
@@ -259,34 +313,71 @@ func (c *Client) Commit(ctx context.Context, path, hash string, size int64, cont
 		op["content"] = base64.StdEncoding.EncodeToString(content)
 		op["encoding"] = "base64"
 	}
-	err := c.json(ctx, "POST", "repos/"+c.C.RepoType+"/"+c.C.Repo+"/commit/"+url.PathEscape(c.C.Revision), map[string]any{"commit_message": "FileCabinet store " + hash, "actions": []any{op}}, nil)
+	actions := []any{op}
+	if metaPath != "" {
+		actions = append(actions, normalAction(metaPath, meta))
+	}
+	err := c.json(ctx, "POST", "repos/"+c.C.RepoType+"/"+c.C.Repo+"/commit/"+url.PathEscape(c.C.Revision), map[string]any{"commit_message": "FileCabinet store " + hash, "actions": actions}, nil)
 	if err != nil {
 		return ErrUncertainMutation
 	}
 	return nil
 }
-func (c *Client) Delete(ctx context.Context, path string) error {
-	suffix := "file"
-	q := url.Values{"FilePath": {path}, "Revision": {c.C.Revision}}
-	if c.C.RepoType == "datasets" {
-		suffix = "repo"
-		q.Del("Revision")
+
+// normalAction encodes an inline base64 file operation, the shape ModelScope uses for
+// small non-LFS files such as the meta documents.
+func normalAction(path string, content []byte) map[string]any {
+	return map[string]any{"action": "create", "path": path, "type": "normal", "size": len(content), "sha256": "", "content": base64.StdEncoding.EncodeToString(content), "encoding": "base64"}
+}
+
+// Delete removes the blob pointer and, when metaPath is set, its meta file.
+//
+// ModelScope rejects a commit whose actions include a path that is not in the
+// revision ("commit rejected by repository policy"), so existence is checked first and
+// already-absent paths are skipped; both paths being absent reports success. The old
+// DELETE endpoint is unusable here: it currently answers 400 "the current token no
+// longer supports deletion operations". A failed existence check returns ErrUpstream
+// before any mutation, so the caller may safely retry rather than quarantine.
+func (c *Client) Delete(ctx context.Context, path, metaPath string) error {
+	paths := []string{path}
+	if metaPath != "" {
+		paths = append(paths, metaPath)
 	}
-	req, e := http.NewRequestWithContext(ctx, "DELETE", c.path(c.C.RepoType+"/"+c.C.Repo+"/"+suffix)+"?"+q.Encode(), nil)
+	var actions []any
+	for _, p := range paths {
+		b, e := c.ReadFile(ctx, p)
+		if e != nil {
+			return e
+		}
+		if b != nil {
+			actions = append(actions, map[string]any{"action": "delete", "path": p})
+		}
+	}
+	if len(actions) == 0 {
+		return nil
+	}
+	payload, e := json.Marshal(map[string]any{"commit_message": "FileCabinet delete " + path, "actions": actions})
+	if e != nil {
+		return ErrUpstream
+	}
+	req, e := http.NewRequestWithContext(ctx, "POST", c.path("repos/"+c.C.RepoType+"/"+c.C.Repo+"/commit/"+url.PathEscape(c.C.Revision)), bytes.NewReader(payload))
 	if e != nil {
 		return ErrUpstream
 	}
 	c.auth(req)
+	req.Header.Set("Content-Type", "application/json")
 	resp, e := c.API.Do(req)
 	if e != nil {
 		return ErrUncertainMutation
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == 404 {
-		return nil
-	}
+	// A definite rejection did not apply; an interrupted or 5xx commit may have.
 	if resp.StatusCode >= 500 || resp.StatusCode == 408 {
 		return ErrUncertainMutation
+	}
+	// The path disappeared between the probe and the commit: the desired state holds.
+	if resp.StatusCode == 404 {
+		return nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return ErrUpstream

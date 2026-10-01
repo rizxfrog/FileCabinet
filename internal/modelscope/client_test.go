@@ -59,38 +59,48 @@ func TestWireProtocol(t *testing.T) {
 					}
 					_ = json.NewDecoder(r.Body).Decode(&b)
 					a := b.Actions[0]
-					if a["action"] != "create" || a["path"] != "00/aa/path" {
+					if a["path"] != "00/aa/path" {
 						t.Error(a)
 					}
-					if a["type"] == "normal" {
-						if a["content"] != "aGk=" || a["sha256"] != "" || a["encoding"] != "base64" {
+					switch a["action"] {
+					case "create":
+						if a["type"] == "normal" {
+							if a["content"] != "aGk=" || a["sha256"] != "" || a["encoding"] != "base64" {
+								t.Error(a)
+							}
+						} else if a["sha256"] != hash || a["content"] != "" || a["encoding"] != "" {
 							t.Error(a)
 						}
-					} else {
-						if a["sha256"] != hash || a["content"] != "" || a["encoding"] != "" {
-							t.Error(a)
+						// A commit carrying meta must send both actions together.
+						if len(b.Actions) == 2 {
+							if b.Actions[1]["path"] != "00/aa/meta.json" || b.Actions[1]["type"] != "normal" || b.Actions[1]["action"] != "create" {
+								t.Error("meta action", b.Actions)
+							}
+						} else if len(b.Actions) != 1 {
+							t.Error("unexpected action count", b.Actions)
 						}
+					case "delete":
+						if len(b.Actions) != 2 || b.Actions[1]["path"] != "00/aa/meta.json" {
+							t.Error("delete actions", b.Actions)
+						}
+					default:
+						t.Error("unexpected action", a)
 					}
 					io.WriteString(w, `{"Code":200,"Success":true,"Data":{}}`)
-				case r.Method == "DELETE":
-					suffix := "file"
-					if kind == "datasets" {
-						suffix = "repo"
-						if r.URL.Query().Has("Revision") {
-							t.Error("dataset delete must not send revision")
-						}
-					} else if r.URL.Query().Get("Revision") != "master" {
-						t.Error("model revision missing")
-					}
-					if r.URL.Path != "/api/v1/"+kind+"/owner/repo/"+suffix || r.URL.Query().Get("FilePath") != "00/aa/path" {
-						t.Error(r.URL)
-					}
-					io.WriteString(w, `{"Code":200,"Data":{}}`)
 				case r.Method == "GET":
-					if r.URL.Path != "/api/v1/"+kind+"/owner/repo/repo" || r.URL.Query().Get("Revision") != "master" || r.URL.Query().Get("FilePath") != "00/aa/path" {
+					if r.URL.Path != "/api/v1/"+kind+"/owner/repo/repo" || r.URL.Query().Get("Revision") != "master" {
 						t.Error(r.URL)
 					}
-					io.WriteString(w, "hi")
+					// Existence probes (delete) and meta reads share this route.
+					switch r.URL.Query().Get("FilePath") {
+					case "00/aa/path":
+						io.WriteString(w, "hi")
+					case "00/aa/meta.json":
+						io.WriteString(w, `{"file_name":"x.bin","size":2}`)
+					default:
+						w.WriteHeader(404)
+						io.WriteString(w, `{"Code":10020101028,"Message":"file missing"}`)
+					}
 				default:
 					t.Error("unexpected request", r.URL)
 				}
@@ -102,21 +112,30 @@ func TestWireProtocol(t *testing.T) {
 			if e != nil || !strings.Contains(target, "signature=") {
 				t.Fatal(target, e)
 			}
-			if e = c.Commit(ctx, "00/aa/path", hash, 2, []byte("hi")); e != nil {
+			meta := []byte(`{"file_name":"x.bin","size":2}`)
+			if e = c.Commit(ctx, "00/aa/path", "00/aa/meta.json", hash, 2, []byte("hi"), meta); e != nil {
 				t.Fatal(e)
 			}
-			if e = c.Commit(ctx, "00/aa/path", hash, 6000000, nil); e != nil {
+			if e = c.Commit(ctx, "00/aa/path", "", hash, 6000000, nil, nil); e != nil {
 				t.Fatal(e)
 			}
-			if e = c.Delete(ctx, "00/aa/path"); e != nil {
+			if e = c.Delete(ctx, "00/aa/path", "00/aa/meta.json"); e != nil {
 				t.Fatal(e)
+			}
+			if b, e := c.ReadFile(ctx, "00/aa/meta.json"); e != nil || string(b) != string(meta) {
+				t.Fatal("meta read", string(b), e)
+			}
+			if b, e := c.ReadFile(ctx, "00/aa/gone"); e != nil || b != nil {
+				t.Fatal("absent path must be nil, nil", b, e)
 			}
 			resp, e := c.Download(ctx, "00/aa/path")
 			if e != nil {
 				t.Fatal(e)
 			}
 			resp.Body.Close()
-			if requests != 5 {
+			// batch, 2 commits, 2 existence probes + 1 delete commit, 1 download,
+			// 1 meta read, 1 absent read.
+			if requests != 9 {
 				t.Fatal(requests)
 			}
 		})
@@ -191,15 +210,57 @@ func TestStorageNoTokenAndDownloadRedirect(t *testing.T) {
 	}
 }
 
+// Delete probes existence first: an absent path must never reach the commit, because
+// ModelScope rejects a commit containing a path that is not in the revision.
+func TestDeleteSkipsAbsentPaths(t *testing.T) {
+	c := New(config.Config{Endpoint: "https://www.modelscope.cn", Repo: "o/r", RepoType: "models", Revision: "master"})
+	var commits int
+	c.API = &http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "/commit/") {
+			commits++
+			return response(`{"Code":200,"Success":true}`), nil
+		}
+		res := response("")
+		res.StatusCode = 404
+		return res, nil
+	})}
+	if e := c.Delete(context.Background(), "00/aa/path", "00/aa/meta.json"); e != nil {
+		t.Fatal(e)
+	}
+	if commits != 0 {
+		t.Fatal("absent paths must not be committed", commits)
+	}
+	// Existence check failure must abort before mutating.
+	c.API = &http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "/commit/") {
+			commits++
+			return response(`{"Code":200,"Success":true}`), nil
+		}
+		res := response("")
+		res.StatusCode = 500
+		return res, nil
+	})}
+	if e := c.Delete(context.Background(), "00/aa/path", ""); !errors.Is(e, ErrUpstream) || errors.Is(e, ErrUncertainMutation) {
+		t.Fatal("failed existence probe must be retryable", e)
+	}
+	if commits != 0 {
+		t.Fatal("must not commit after a failed probe", commits)
+	}
+}
+
 func TestDeleteOutcomeClassification(t *testing.T) {
+	// The probe succeeds (path exists); only the commit's outcome is varied.
 	for _, status := range []int{403, 429, 500, 408, 200, 404} {
 		c := New(config.Config{Endpoint: "https://www.modelscope.cn", Repo: "o/r", RepoType: "models", Revision: "master"})
-		c.API = &http.Client{Transport: transport(func(*http.Request) (*http.Response, error) {
-			r := response(`{"Code":200,"Success":true}`)
-			r.StatusCode = status
-			return r, nil
+		c.API = &http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
+			if !strings.Contains(r.URL.Path, "/commit/") {
+				return response("present"), nil
+			}
+			res := response(`{"Code":200,"Success":true}`)
+			res.StatusCode = status
+			return res, nil
 		})}
-		err := c.Delete(context.Background(), "00/aa/path")
+		err := c.Delete(context.Background(), "00/aa/path", "")
 		if status == 500 || status == 408 {
 			if !errors.Is(err, ErrUncertainMutation) {
 				t.Fatal("unknown delete not quarantined", status, err)
@@ -425,7 +486,7 @@ func TestMutationsRequireExplicitSuccess(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			c := New(config.Config{Endpoint: "https://www.modelscope.cn", Repo: "o/r", RepoType: "models", Revision: "master"})
 			c.API.Transport = transport(func(*http.Request) (*http.Response, error) { return response(body), nil })
-			for _, err := range []error{c.Commit(context.Background(), "path", strings.Repeat("a", 64), 0, nil), c.Delete(context.Background(), "path")} {
+			for _, err := range []error{c.Commit(context.Background(), "path", "", strings.Repeat("a", 64), 0, nil, nil), c.Delete(context.Background(), "path", "")} {
 				if !errors.Is(err, ErrUncertainMutation) {
 					t.Fatal("unconfirmed mutation succeeded", body, err)
 				}
@@ -435,10 +496,10 @@ func TestMutationsRequireExplicitSuccess(t *testing.T) {
 	for _, body := range []string{`{"Code":200}`, `{"Code":"200","Success":true,"Data":{}}`} {
 		c := New(config.Config{Endpoint: "https://www.modelscope.cn"})
 		c.API.Transport = transport(func(*http.Request) (*http.Response, error) { return response(body), nil })
-		if err := c.Commit(context.Background(), "path", strings.Repeat("a", 64), 0, nil); err != nil {
+		if err := c.Commit(context.Background(), "path", "", strings.Repeat("a", 64), 0, nil, nil); err != nil {
 			t.Fatal(body, err)
 		}
-		if err := c.Delete(context.Background(), "path"); err != nil {
+		if err := c.Delete(context.Background(), "path", ""); err != nil {
 			t.Fatal(body, err)
 		}
 	}
@@ -464,9 +525,50 @@ func TestOversizedMutationEnvelopeCannotHideTrailingData(t *testing.T) {
 	c := New(config.Config{Endpoint: "https://www.modelscope.cn"})
 	body := `{"Code":200}` + strings.Repeat(" ", 2<<20) + `invalid trailing data`
 	c.API.Transport = transport(func(*http.Request) (*http.Response, error) { return response(body), nil })
-	for _, err := range []error{c.Commit(context.Background(), "path", strings.Repeat("a", 64), 0, nil), c.Delete(context.Background(), "path")} {
-		if !errors.Is(err, ErrUncertainMutation) {
-			t.Fatal("truncated response confirmed mutation", err)
+	if err := c.Commit(context.Background(), "path", "", strings.Repeat("a", 64), 0, nil, nil); !errors.Is(err, ErrUncertainMutation) {
+		t.Fatal("truncated response confirmed mutation", err)
+	}
+	// Delete's existence probe reads through the same bound and must abort before any
+	// mutation when the response is unusable.
+	if err := c.Delete(context.Background(), "path", ""); !errors.Is(err, ErrUpstream) || errors.Is(err, ErrUncertainMutation) {
+		t.Fatal("oversized probe must abort retryably", err)
+	}
+}
+
+// A readable repository file answers 302 to storage; the read must follow an allowlisted
+// redirect without carrying the credential, and must treat an absent path as absent.
+func TestReadFileFollowsStorageRedirect(t *testing.T) {
+	c := New(config.Config{Endpoint: "https://www.modelscope.cn", Token: "secret", Repo: "o/r", RepoType: "datasets", Revision: "master", UploadHosts: []string{".modelscope.cn"}})
+	c.API = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: transport(func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Error("api read must authenticate")
 		}
+		return &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{"https://cdn-lfs-cn-1.modelscope.cn/prod/x"}}, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+	})}
+	c.Storage = &http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+			t.Error("storage read leaked the credential")
+		}
+		return response(`{"file_name":"x.bin","size":3}`), nil
+	})}
+	b, e := c.ReadFile(context.Background(), "00/meta/aa/x.json")
+	if e != nil || string(b) != `{"file_name":"x.bin","size":3}` {
+		t.Fatal("redirected read", string(b), e)
+	}
+	// Redirects outside the storage allowlist must be refused.
+	c.API = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: transport(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{"https://evil.example.com/x"}}, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+	})}
+	if _, e := c.ReadFile(context.Background(), "00/meta/aa/x.json"); !errors.Is(e, ErrUpstream) {
+		t.Fatal("unsafe redirect accepted", e)
+	}
+	// A 404 is "absent", not an error.
+	c.API = &http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
+		res := response(`{"Code":10020101028,"Message":"missing"}`)
+		res.StatusCode = 404
+		return res, nil
+	})}
+	if b, e := c.ReadFile(context.Background(), "00/meta/aa/gone.json"); b != nil || e != nil {
+		t.Fatal("absent path", b, e)
 	}
 }

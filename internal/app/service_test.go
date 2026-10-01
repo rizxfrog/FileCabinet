@@ -29,13 +29,17 @@ import (
 type fakeUpstream struct {
 	afterCommit                     func()
 	mu                              sync.Mutex
-	commits, deletes, puts          int
+	commits, deletes, puts, reads   int
 	failCommit, failDelete, failPut bool
+	failRead                        bool
 	uncertainDelete                 bool
 	validateURL                     string
 	directLoc                       string
 	deleteEntered, deleteRelease    chan struct{}
 	content                         []byte
+	meta                            []byte
+	metaPath                        string
+	files                           map[string][]byte
 }
 
 func (u *fakeUpstream) Validate(context.Context, string, int64) (string, error) {
@@ -54,11 +58,16 @@ func (u *fakeUpstream) Put(_ context.Context, _, _ string, r io.Reader, _ int64)
 	_, e := io.Copy(io.Discard, r)
 	return e
 }
-func (u *fakeUpstream) Commit(_ context.Context, _, _ string, _ int64, b []byte) error {
+func (u *fakeUpstream) Commit(_ context.Context, _, metaPath, _ string, _ int64, b, meta []byte) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.commits++
 	u.content = append([]byte(nil), b...)
+	u.metaPath = metaPath
+	u.meta = append([]byte(nil), meta...)
+	if u.files != nil && metaPath != "" {
+		u.files[metaPath] = append([]byte(nil), meta...)
+	}
 	if u.afterCommit != nil {
 		u.afterCommit()
 	}
@@ -67,7 +76,7 @@ func (u *fakeUpstream) Commit(_ context.Context, _, _ string, _ int64, b []byte)
 	}
 	return nil
 }
-func (u *fakeUpstream) Delete(context.Context, string) error {
+func (u *fakeUpstream) Delete(_ context.Context, _, metaPath string) error {
 	if u.deleteEntered != nil {
 		u.deleteEntered <- struct{}{}
 		<-u.deleteRelease
@@ -75,6 +84,9 @@ func (u *fakeUpstream) Delete(context.Context, string) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.deletes++
+	if u.files != nil && metaPath != "" {
+		delete(u.files, metaPath)
+	}
 	if u.uncertainDelete {
 		return modelscope.ErrUncertainMutation
 	}
@@ -82,6 +94,21 @@ func (u *fakeUpstream) Delete(context.Context, string) error {
 		return modelscope.ErrUpstream
 	}
 	return nil
+}
+
+// ReadFile serves a metadata document. A nil byte slice means the path does not exist,
+// matching the real client's absent-path contract.
+func (u *fakeUpstream) ReadFile(_ context.Context, path string) ([]byte, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.reads++
+	if u.failRead {
+		return nil, modelscope.ErrUpstream
+	}
+	if u.files == nil {
+		return nil, nil
+	}
+	return append([]byte(nil), u.files[path]...), nil
 }
 func (u *fakeUpstream) Download(context.Context, string) (*http.Response, error) {
 	return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(u.content))}, nil
@@ -649,10 +676,18 @@ func TestMalformedMutationKeepsJournal(t *testing.T) {
 				a, _, _ := setup(t)
 				ctx := context.Background()
 				c := modelscope.New(config.Config{Endpoint: "https://www.modelscope.cn", Repo: "o/r", RepoType: "models", Revision: "master"})
+				// Count mutations only: delete now probes existence with reads first, so
+				// an all-request counter would no longer describe retry behaviour.
 				calls := 0
-				c.API.Transport = apiTransport(func(*http.Request) (*http.Response, error) {
-					calls++
-					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+				c.API.Transport = apiTransport(func(r *http.Request) (*http.Response, error) {
+					if strings.Contains(r.URL.Path, "/commit/") {
+						calls++
+					}
+					status := 200
+					if strings.Contains(r.URL.Query().Get("FilePath"), "meta") {
+						status = 404
+					}
+					return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 				})
 				a.U = c
 				b := []byte("uncertain envelope")
@@ -805,5 +840,145 @@ func TestDownloadDirectStillAuthorizes(t *testing.T) {
 	a.Handler(fstest.MapFS{}).ServeHTTP(rr, httptest.NewRequest("GET", "/api/download/"+f.Hash, nil))
 	if rr.Code != 404 {
 		t.Fatalf("expired direct download allowed: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+// The meta document is committed with the blob and is the durable source of the name,
+// so a lookup must prefer it over whatever Redis holds.
+func TestMetaPathAndNameResolution(t *testing.T) {
+	a, u, _ := setup(t)
+	u.files = map[string][]byte{}
+	ctx := context.Background()
+	b := []byte("meta-name")
+	f := file(b, 0)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	want := a.C.Namespace + "/meta/" + f.Hash[:2] + "/" + f.Hash[2:] + ".json"
+	if u.metaPath != want {
+		t.Fatalf("meta committed at %q, want %q", u.metaPath, want)
+	}
+	if _, _, ok := parseMeta(u.meta); !ok {
+		t.Fatalf("committed meta is not a record: %s", u.meta)
+	}
+	// A stale Redis name must not win over the committed document.
+	stale := f
+	stale.Name = "stale.txt"
+	if e := a.S.Save(ctx, stale); e != nil {
+		t.Fatal(e)
+	}
+	got, e := a.Resolve(ctx, f.Hash)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if got.Name != f.Name {
+		t.Fatalf("meta name ignored: got %q want %q", got.Name, f.Name)
+	}
+	// Without a committed document the Redis name is all there is.
+	delete(u.files, want)
+	got, e = a.Resolve(ctx, f.Hash)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if got.Name != "stale.txt" {
+		t.Fatalf("Redis name must survive a missing document: %q", got.Name)
+	}
+}
+
+// A lost Redis record must not lose the file: the committed document reconstructs name
+// and size, and the download still succeeds.
+func TestResolveRecoversFromCommittedMeta(t *testing.T) {
+	a, u, _ := setup(t)
+	u.files = map[string][]byte{}
+	ctx := context.Background()
+	b := []byte("recover-me")
+	f := file(b, 0)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	if e := a.S.Remove(ctx, f.Hash); e != nil {
+		t.Fatal(e)
+	}
+	got, e := a.Resolve(ctx, f.Hash)
+	if e != nil {
+		t.Fatalf("committed meta did not recover the record: %v", e)
+	}
+	if got.Name != f.Name || got.Size != f.Size || got.ExpiresAt != 0 {
+		t.Fatalf("recovered %+v, want name=%q size=%d expiry=0", got, f.Name, f.Size)
+	}
+	// authorize re-reads Redis; the recovered record must survive that.
+	if _, _, e := a.authorize(ctx, f.Hash); e != nil {
+		t.Fatalf("recovered file not downloadable: %v", e)
+	}
+	// A hash with no document stays missing.
+	if _, e := a.Resolve(ctx, strings.Repeat("b", 64)); !errors.Is(e, store.ErrMissing) {
+		t.Fatalf("unknown hash resolved: %v", e)
+	}
+}
+
+// An unrelated repository file must not be adopted as a FileCabinet record.
+func TestRecoverRejectsForeignContent(t *testing.T) {
+	a, u, _ := setup(t)
+	ctx := context.Background()
+	h := strings.Repeat("c", 64)
+	for _, body := range []string{"", "not json", `{"message":"nope"}`, `{"size":"x"}`, `{"size":-1}`} {
+		u.files = map[string][]byte{a.MetaPath(h): []byte(body)}
+		if _, e := a.Resolve(ctx, h); !errors.Is(e, store.ErrMissing) {
+			t.Fatalf("adopted %q: %v", body, e)
+		}
+	}
+	// A record with an unusable or empty name still recovers; only the size is load
+	// bearing, and the name falls back to the hash rather than discarding the file.
+	for _, body := range []string{`{"file_name":"","size":7}`, `{"file_name":"a/b.txt","size":7}`, `{"size":7}`} {
+		u.files = map[string][]byte{a.MetaPath(h): []byte(body)}
+		got, e := a.Resolve(ctx, h)
+		if e != nil || got.Name != h || got.Size != 7 {
+			t.Fatalf("got %+v err=%v for %s", got, e, body)
+		}
+	}
+}
+
+// A failing meta read must degrade to the Redis name, never break the download.
+func TestMetaReadFailureKeepsFileAvailable(t *testing.T) {
+	a, u, _ := setup(t)
+	ctx := context.Background()
+	b := []byte("meta-fail")
+	f := file(b, 0)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	u.failRead = true
+	got, e := a.Resolve(ctx, f.Hash)
+	if e != nil {
+		t.Fatalf("meta failure broke lookup: %v", e)
+	}
+	if got.Name != f.Name {
+		t.Fatalf("lost the Redis name: %q", got.Name)
+	}
+}
+
+// Cleanup must remove the document with the blob, and a missing document must not turn
+// an empty file into an invalid record.
+func TestCleanupRemovesMetaAndEmptyFileRoundTrips(t *testing.T) {
+	a, u, _ := setup(t)
+	u.files = map[string][]byte{}
+	ctx := context.Background()
+	sum := sha256.Sum256(nil)
+	empty := store.File{Hash: hex.EncodeToString(sum[:]), Name: "empty.bin", Size: 0, ExpiresAt: a.Now().Unix() + 1}
+	if _, e := a.Upload(ctx, empty, bytes.NewReader(nil)); e != nil {
+		t.Fatal(e)
+	}
+	if _, _, ok := parseMeta(u.meta); !ok {
+		t.Fatal("empty file must still commit a valid record")
+	}
+	a.Now = func() time.Time { return time.Unix(empty.ExpiresAt+1, 0) }
+	if e := a.Cleanup(ctx); e != nil {
+		t.Fatal(e)
+	}
+	if _, ok := u.files[a.MetaPath(empty.Hash)]; ok {
+		t.Fatal("cleanup left the meta document behind")
+	}
+	if p, _ := a.S.Pending(ctx, empty.Hash); p != "" {
+		t.Fatalf("journal not cleared: %q", p)
 	}
 }
