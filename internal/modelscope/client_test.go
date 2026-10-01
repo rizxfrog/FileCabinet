@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -195,6 +196,131 @@ func TestDeleteOutcomeClassification(t *testing.T) {
 // Captured ModelScope batch shape, not an invented cloud presigned response.
 func lfsFixture(hash, target string, size int64) string {
 	return fmt.Sprintf(`{"Code":200,"Success":true,"Message":"success","Data":{"objects":[{"oid":%q,"size":%d,"actions":{"upload":{"href":%q,"offset":0,"upload_header":{"Range":"bytes=0-"},"upload_parameters":{}}}}],"reused-objects":[]}}`, hash, size, target)
+}
+
+// Captured ModelScope download redirect shape: the API answers 302 to a CDN URL
+// carrying an opaque auth_key plus repository layout probes we must strip.
+func TestDownloadTargetRedirectAndProbes(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	// Real upstream shape: bucket prefix, hash split across segments, layout probes,
+	// and the opaque signature.
+	cdn := "https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/aa/aa/" + hash +
+		"?filename=" + hash + "&namespace=owner&repository=repo&revision=deadbeef&tag=dataset&auth_key=123-abc"
+	c := New(config.Config{Endpoint: "https://www.modelscope.cn", Token: "secret", Repo: "owner/repo", RepoType: "datasets", Revision: "master", UploadHosts: []string{".modelscope.cn"}})
+	var gotURL string
+	c.API = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: transport(func(r *http.Request) (*http.Response, error) {
+		gotURL = r.URL.String()
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatal("api call unauthenticated")
+		}
+		return &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{cdn}}, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+	})}
+	loc, resp, e := c.DownloadTarget(context.Background(), "00/aa/path", hash, "novelread.apk")
+	if e != nil || resp != nil {
+		t.Fatal(loc, resp, e)
+	}
+	if !strings.Contains(gotURL, "/api/v1/datasets/owner/repo/repo") || !strings.Contains(gotURL, "FilePath=00%2Faa%2Fpath") {
+		t.Fatal(gotURL)
+	}
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q := u.Query(); q.Get("auth_key") != "123-abc" || q.Get("namespace") != "" || q.Get("repository") != "" || q.Get("revision") != "" || q.Get("tag") != "" {
+		t.Fatalf("layout probes not stripped, signature not preserved: %s", loc)
+	} else if len(q) != 2 || q.Get("filename") != "novelread.apk" {
+		// filename is not covered by the signature, so it carries the real name while
+		// every repository layout probe is removed.
+		t.Fatalf("unexpected query params: %s", loc)
+	}
+}
+
+// A misconfigured or hostile upstream must not be able to redirect to a different
+// object, another host outside the allowlist, or a plain-HTTP target.
+func TestDownloadTargetRejectsUnsafeRedirects(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	for _, raw := range []string{
+		"https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/aa/aa/" + strings.Repeat("b", 60) + "?auth_key=1",
+		"https://evil.example/prod/" + hash + "?auth_key=1",
+		"https://cdn.evil-modelscope.cn/" + hash + "?auth_key=1",
+		"http://cdn-lfs-cn-1.modelscope.cn/" + hash + "?auth_key=1",
+		"https://user:pass@cdn-lfs-cn-1.modelscope.cn/" + hash,
+		"https://cdn-lfs-cn-1.modelscope.cn:8443/" + hash,
+	} {
+		c := New(config.Config{Endpoint: "https://www.modelscope.cn", Token: "secret", Repo: "owner/repo", RepoType: "datasets", Revision: "master", UploadHosts: []string{".modelscope.cn"}})
+		c.API = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: transport(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{raw}}, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+		})}
+		if loc, resp, e := c.DownloadTarget(context.Background(), "00/aa/path", hash, "novel.apk"); e == nil || loc != "" || resp != nil {
+			t.Fatalf("unsafe redirect accepted: %s", raw)
+		}
+	}
+}
+
+// Upstream echoes the filename query value verbatim into the CDN Content-Disposition
+// header, so the encoding we choose is what the browser ends up showing. Raw UTF-8 or
+// spaces would make the URL invalid, percent-encoding is decoded by browsers, and "+"
+// must be avoided because the CDN echoes it literally as "my+file.apk".
+func TestDownloadTargetFilenameEncoding(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	cdn := "https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/aa/aa/" + hash + "?auth_key=123-abc&filename=" + hash
+	for _, tc := range []struct{ name, want string }{
+		{"说明.txt", "说明.txt"},
+		{"my file.apk", "my file.apk"},
+		{"a+b.apk", "a+b.apk"},
+		{"novelread.apk", "novelread.apk"},
+		// Rejected names fall back to the hash the caller already knows.
+		{"../../etc/passwd", hash},
+		{"bad\r\nX: y", hash},
+		{"a\"b.apk", hash},
+		{"", hash},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(config.Config{Endpoint: "https://www.modelscope.cn", Token: "secret", Repo: "owner/repo", RepoType: "datasets", Revision: "master", UploadHosts: []string{".modelscope.cn"}})
+			c.API = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: transport(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{cdn}}, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+			})}
+			loc, resp, e := c.DownloadTarget(context.Background(), "00/aa/path", hash, tc.name)
+			if e != nil || resp != nil {
+				t.Fatal(loc, resp, e)
+			}
+			u, err := url.Parse(loc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The decoded value is the filename the browser will show.
+			if got := u.Query().Get("filename"); got != tc.want {
+				t.Fatalf("filename=%q, want %q (%s)", got, tc.want, loc)
+			}
+			// Pin the exact wire bytes: url.QueryEscape turns a space into "+", which the
+			// CDN echoes literally ("my+file.apk"), so the client must emit %20 instead.
+			wire := strings.ReplaceAll(url.QueryEscape(tc.want), "+", "%20")
+			if !strings.Contains(loc, "filename="+wire+"&") && !strings.HasSuffix(loc, "filename="+wire) {
+				t.Fatalf("filename not encoded as %q: %s", wire, loc)
+			}
+		})
+	}
+}
+
+// Small/inline and other non-LFS files are answered with the body itself, so the
+// caller must be handed a stream instead of a URL and must not retry upstream.
+func TestDownloadTargetInlineBody(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	calls := 0
+	c := New(config.Config{Endpoint: "https://www.modelscope.cn", Token: "secret", Repo: "owner/repo", RepoType: "datasets", Revision: "master", UploadHosts: []string{".modelscope.cn"}})
+	c.API = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: transport(func(r *http.Request) (*http.Response, error) {
+		calls++
+		return response("hello"), nil
+	})}
+	loc, resp, e := c.DownloadTarget(context.Background(), "00/aa/path", hash, "novel.apk")
+	if e != nil || loc != "" || resp == nil || calls != 1 {
+		t.Fatal(loc, resp, e, calls)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(b) != "hello" {
+		t.Fatal(string(b))
+	}
 }
 func TestLFSUploadAuthenticationAndDirectRefusal(t *testing.T) {
 	for _, kind := range []string{"models", "datasets"} {

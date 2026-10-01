@@ -44,7 +44,7 @@ func (l *Lifecycle) Wrap(next http.Handler) http.Handler {
 func (a *Service) Handler(assets fs.FS) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/config", func(w http.ResponseWriter, r *http.Request) {
-		reply(w, 200, map[string]any{"upload_mode": a.C.UploadMode, "max_upload_bytes": a.C.MaxBytes, "inline_limit": modelscope.InlineLimit, "unsafe_direct_expose_url": a.C.UnsafeDirectExposeURL})
+		reply(w, 200, map[string]any{"upload_mode": a.C.UploadMode, "download_mode": a.C.DownloadMode, "max_upload_bytes": a.C.MaxBytes, "inline_limit": modelscope.InlineLimit, "unsafe_direct_expose_url": a.C.UnsafeDirectExposeURL})
 	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
@@ -134,19 +134,30 @@ func (a *Service) Handler(assets fs.FS) http.Handler {
 		reply(w, 201, c)
 	})
 	mux.HandleFunc("GET /api/download/{key}", func(w http.ResponseWriter, r *http.Request) {
-		f, resp, e := a.Open(r.Context(), r.PathValue("key"))
+		key := r.PathValue("key")
+		if a.C.DownloadMode == "direct" {
+			f, loc, resp, e := a.DirectDownload(r.Context(), key)
+			if e != nil {
+				fail(w, e)
+				return
+			}
+			if resp == nil {
+				// Signed upstream URL: the browser fetches bytes from storage directly.
+				w.Header().Set("Cache-Control", "no-store")
+				http.Redirect(w, r, loc, http.StatusFound)
+				return
+			}
+			defer resp.Body.Close()
+			streamFile(w, f, resp)
+			return
+		}
+		f, resp, e := a.Open(r.Context(), key)
 		if e != nil {
 			fail(w, e)
 			return
 		}
 		defer resp.Body.Close()
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": f.Name}))
-		w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
-		w.WriteHeader(200)
-		if n, e := io.Copy(w, io.LimitReader(resp.Body, f.Size)); e != nil || n != f.Size {
-			slog.Warn("download stream interrupted")
-		}
+		streamFile(w, f, resp)
 	})
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, 404, map[string]string{"error": "接口不存在"})
@@ -167,9 +178,9 @@ func (a *Service) Handler(assets fs.FS) http.Handler {
 		files.ServeHTTP(w, r)
 	})
 	// Config validates host suffix syntax. CSP permits only HTTPS hosts accepted by
-	// the storage allowlist, and only when browser direct uploads are enabled.
+	// the storage allowlist, and only when a direct (browser-facing) mode is enabled.
 	connectSrc := "'self'"
-	if a.C.UploadMode == "direct" {
+	if a.C.UploadMode == "direct" || a.C.DownloadMode == "direct" {
 		for _, suffix := range a.C.UploadHosts {
 			host := strings.TrimPrefix(suffix, ".")
 			connectSrc += " https://" + host + " https://*." + host
@@ -240,6 +251,18 @@ func reply(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// streamFile relays upstream bytes with our own headers. The upstream body stays
+// owned by the caller; callers must close it.
+func streamFile(w http.ResponseWriter, f store.File, resp *http.Response) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": f.Name}))
+	w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
+	w.WriteHeader(200)
+	if n, e := io.Copy(w, io.LimitReader(resp.Body, f.Size)); e != nil || n != f.Size {
+		slog.Warn("download stream interrupted")
+	}
 }
 func fail(w http.ResponseWriter, e error) {
 	status := 503

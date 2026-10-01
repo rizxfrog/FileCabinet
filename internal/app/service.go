@@ -30,6 +30,7 @@ type Upstream interface {
 	Commit(context.Context, string, string, int64, []byte) error
 	Delete(context.Context, string) error
 	Download(context.Context, string) (*http.Response, error)
+	DownloadTarget(context.Context, string, string, string) (string, *http.Response, error)
 }
 type Service struct {
 	C         config.Config
@@ -476,6 +477,51 @@ func (a *Service) Complete(ctx context.Context, id string) (store.File, error) {
 
 // Hold the file lock until the response body is closed so cleanup cannot delete during download.
 func (a *Service) Open(ctx context.Context, key string) (store.File, *http.Response, error) {
+	f, unlock, e := a.authorize(ctx, key)
+	if e != nil {
+		return f, nil, e
+	}
+	resp, e := a.U.Download(ctx, a.Path(f.Hash))
+	if e != nil {
+		unlock()
+		return f, nil, e
+	}
+	resp.Body = &lockedBody{ReadCloser: resp.Body, unlock: unlock}
+	return f, resp, nil
+}
+
+// DirectDownload authorizes a download exactly like Open, then asks upstream for a
+// URL the browser can fetch itself. It returns (signedURL, nil) when upstream issued
+// a redirect, or ("", resp) when upstream streamed the body directly (inline and other
+// non-LFS files); the caller then proxies resp like Open, without a second request.
+//
+// The per-hash lock is held only for the request itself. No lock protects the bytes
+// after a redirect: an already-issued URL cannot be revoked, so expiry, short codes
+// and cleanup still govern future requests but not the URL just handed out. Callers
+// must treat a signed URL as a bearer credential and must not log it.
+func (a *Service) DirectDownload(ctx context.Context, key string) (store.File, string, *http.Response, error) {
+	f, unlock, e := a.authorize(ctx, key)
+	if e != nil {
+		return f, "", nil, e
+	}
+	loc, resp, e := a.U.DownloadTarget(ctx, a.Path(f.Hash), f.Hash, f.Name)
+	if e != nil {
+		unlock()
+		return f, "", nil, e
+	}
+	if resp != nil {
+		resp.Body = &lockedBody{ReadCloser: resp.Body, unlock: unlock}
+		return f, "", resp, nil
+	}
+	// No bytes flow through this process, so the lock can be released now.
+	unlock()
+	return f, loc, nil, nil
+}
+
+// authorize performs the full read authorization: resolve key or short code, take
+// the per-hash lock, verify the owner claim, the pending journal, the file expiry
+// and the short-code validity. The caller owns the returned unlock function.
+func (a *Service) authorize(ctx context.Context, key string) (store.File, func(), error) {
 	f, e := a.Resolve(ctx, key)
 	if e != nil {
 		return f, nil, e
@@ -506,13 +552,7 @@ func (a *Service) Open(ctx context.Context, key string) (store.File, *http.Respo
 			return f, nil, err
 		}
 	}
-	resp, e := a.U.Download(ctx, a.Path(f.Hash))
-	if e != nil {
-		unlock()
-		return f, nil, e
-	}
-	resp.Body = &lockedBody{ReadCloser: resp.Body, unlock: unlock}
-	return f, resp, nil
+	return f, unlock, nil
 }
 
 type lockedBody struct {

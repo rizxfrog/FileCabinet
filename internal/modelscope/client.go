@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"FileCabinet/internal/config"
 )
@@ -296,15 +297,9 @@ func (c *Client) Delete(ctx context.Context, path string) error {
 
 // Download authenticates only the initial API request. Redirects never inherit credentials.
 func (c *Client) Download(ctx context.Context, path string) (*http.Response, error) {
-	q := url.Values{"Revision": {c.C.Revision}, "FilePath": {path}}
-	req, e := http.NewRequestWithContext(ctx, "GET", c.path(c.C.RepoType+"/"+c.C.Repo+"/repo")+"?"+q.Encode(), nil)
+	resp, e := c.downloadStart(ctx, path)
 	if e != nil {
-		return nil, ErrUpstream
-	}
-	c.auth(req)
-	resp, e := c.API.Do(req)
-	if e != nil {
-		return nil, ErrUpstream
+		return nil, e
 	}
 	for n := 0; n < 5 && resp.StatusCode >= 300 && resp.StatusCode < 400; n++ {
 		loc, e := resp.Location()
@@ -312,7 +307,7 @@ func (c *Client) Download(ctx context.Context, path string) (*http.Response, err
 		if e != nil || !c.SafeStorageURL(loc.String()) {
 			return nil, ErrUpstream
 		}
-		req, e = http.NewRequestWithContext(ctx, "GET", loc.String(), nil)
+		req, e := http.NewRequestWithContext(ctx, "GET", loc.String(), nil)
 		if e != nil {
 			return nil, ErrUpstream
 		}
@@ -324,6 +319,88 @@ func (c *Client) Download(ctx context.Context, path string) (*http.Response, err
 	if resp.StatusCode != 200 {
 		resp.Body.Close()
 		return nil, fmt.Errorf("%w", ErrUpstream)
+	}
+	return resp, nil
+}
+
+// DownloadTarget performs only the authenticated API request and reports how the file
+// can be obtained without following any redirect, so the credential never leaves the
+// API origin. Exactly one of the two results is set:
+//
+//   - signed != "": upstream answered with a redirect the browser may fetch itself.
+//   - resp != nil (2xx): upstream served the body directly (inline/non-LFS files);
+//     the caller owns the body and must close it. This is not an error.
+//
+// The redirect target must be an allowlisted HTTPS host whose path contains the exact
+// hash, so a misconfigured or hostile upstream cannot turn this into an open redirect
+// to another object or host. name becomes the download filename: it is not covered by
+// the signature, but the value is still sanitized by the caller. Repository layout
+// probes (namespace, repository, revision, tag) are stripped; the signature is kept.
+func (c *Client) DownloadTarget(ctx context.Context, path, hash, name string) (string, *http.Response, error) {
+	resp, e := c.downloadStart(ctx, path)
+	if e != nil {
+		return "", nil, e
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return "", resp, nil
+	}
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+		resp.Body.Close()
+		return "", nil, ErrUpstream
+	}
+	defer resp.Body.Close()
+	loc, e := resp.Location()
+	if e != nil || !c.SafeStorageURL(loc.String()) || !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(hash) {
+		return "", nil, ErrUpstream
+	}
+	u, e := url.Parse(loc.String())
+	// Upstream splits the hash across path segments (/89/6f/a360bd…) and prefixes a
+	// bucket path, so compare against the slash-stripped path instead of the raw one.
+	if e != nil || !strings.Contains(strings.ReplaceAll(u.Path, "/", ""), hash) {
+		return "", nil, ErrUpstream
+	}
+	q := u.Query()
+	for _, k := range []string{"filename", "namespace", "repository", "revision", "tag"} {
+		q.Del(k)
+	}
+	u.RawQuery = q.Encode()
+	if u.RawQuery != "" {
+		u.RawQuery += "&"
+	}
+	// filename controls the attachment header on the CDN response and is not covered by
+	// the signature, so only values that cannot break out of the quoted header are used;
+	// otherwise it falls back to the hash the caller already knows.
+	//
+	// The value is percent-encoded because raw UTF-8 or spaces make the URL invalid, but
+	// upstream echoes whatever it receives into Content-Disposition without decoding it.
+	// QueryEscape would turn a space into "+", which the CDN echoes literally (the browser
+	// then shows "my+file.apk"), so spaces are re-encoded as %20; browsers decode the rest.
+	u.RawQuery += "filename=" + strings.ReplaceAll(url.QueryEscape(safeFilename(name, hash)), "+", "%20")
+	return u.String(), nil, nil
+}
+
+// safeFilename rejects values that could inject into the upstream Content-Disposition
+// header or leak path structure. Store metadata is already validated on upload; this is
+// defense in depth against a corrupt or older record.
+func safeFilename(name, hash string) string {
+	if name == "" || len(name) > 255 || !utf8.ValidString(name) || strings.ContainsAny(name, "\r\n\x00/\\\"") {
+		return hash
+	}
+	return name
+}
+
+// downloadStart performs only the authenticated API request without following
+// redirects, so the ModelScope credential can never leave the API origin.
+func (c *Client) downloadStart(ctx context.Context, path string) (*http.Response, error) {
+	q := url.Values{"Revision": {c.C.Revision}, "FilePath": {path}}
+	req, e := http.NewRequestWithContext(ctx, "GET", c.path(c.C.RepoType+"/"+c.C.Repo+"/repo")+"?"+q.Encode(), nil)
+	if e != nil {
+		return nil, ErrUpstream
+	}
+	c.auth(req)
+	resp, e := c.API.Do(req)
+	if e != nil {
+		return nil, ErrUpstream
 	}
 	return resp, nil
 }

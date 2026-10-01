@@ -6,10 +6,10 @@
 
 - 浏览器在 Web Worker 中每次读取 4 MiB，增量计算 SHA-256，不将大文件整体载入内存。
 - 默认 `UPLOAD_MODE=proxy`。≤5 MiB 经后端校验并 base64 内联提交；更大文件由后端携带认证流式转发至精确校验的 ModelScope LFS 接口（或不带认证转发至真正的存储签名地址），校验实际大小与 SHA-256 后才提交。流量经过后端，内存不随大文件大小增长。上传连接失败不自动重放流。
-- `direct` 提供申请、直传、完成接口，浏览器可实验性尝试大文件直传，未来 CLI / 原生客户端也可复用；仅在上游返回真正的免 token 签名 URL 或 blob 已存在时可用。当前 ModelScope LFS 返回需认证的 API URL，申请新 blob 直传会明确拒绝（422），应使用 `proxy`。原生客户端不受 CORS 限制不等于免认证；浏览器需要上游允许 CORS（或仅在测试时使用 Allow CORS 插件），插件不解决鉴权，小文件仍走内联接口。**不包含 CLI，不下发 ModelScope token，不提供“不安全 302”开关。**
+- 上传/下载都有 `proxy`/`direct` 两档。下载 `direct` 下只用凭证换取上游签名 URL 后 302，字节不经过本服务（代价是该 URL 在自身 `auth_key` 到期前无法撤销）；上传 `direct` 的申请、直传、完成接口仅在上游返回真正的免 token 签名 URL 或 blob 已存在时可用，当前 ModelScope LFS 返回需认证的 API URL，申请新 blob 直传会明确拒绝（422），应使用 `UPLOAD_MODE=proxy`。原生客户端不受 CORS 限制不等于免认证；浏览器需要上游允许 CORS（或仅在测试时使用 Allow CORS 插件），插件不解决鉴权，小文件仍走内联接口。**不包含 CLI，不下发 ModelScope token。**
 - 文件默认永久；1h / 1d / 7d / 自定义绝对到期时间。重复内容只延长有效期，永久优先。proxy 重复上传仍读取并校验传入内容，避免声明 hash 绕过内容校验。
 - 六位数字短码；本次首次数字冲突后改试六位大小写字母与数字混合，Redis SET NX 原子占位。默认到期 `min(文件到期, 当前时间+7天)`；自定义必须未来且严格早于默认值。文件到期后不能生成/使用短码。
-- 下载查询返回本服务相对链接，后端携带凭证请求 ModelScope，跟随受限存储重定向时不携带凭证。文件不会在页面公开列出。
+- 下载查询返回本服务相对链接。`proxy` 模式由后端携带凭证请求 ModelScope、跟随受限存储重定向时不携带凭证并中转字节；`direct` 模式只用凭证换取上游签名直链后 302 给浏览器，字节不经过本服务。文件不会在页面公开列出。
 - 元数据无 TTL，Redis sorted set 保留清理任务；短码和直传会话才使用 TTL。每 30 秒清理最多 100 项，明确拒绝的失败后 60 秒重试；超时/5xx 等未知结果隔离待人工核对；同一文件的上传/续期/删除/下载在锁内串行。
 
 ## 先决条件与启动
@@ -75,6 +75,7 @@ Compose 的 Redis 开启 AOF、`appendfsync always`、`noeviction` 并持久化 
 | `FILECABINET_NAMESPACE` | 两位数字，默认 `00` |
 | `UNSAFE_DIRECT_EXPOSE_URL` | 默认 `false`。仅用于 direct/CORS 实验；开启后会把上游上传 href 返回浏览器，但不会返回 token。此开关危险，测试后必须立即关闭；proxy 模式忽略。 |
 | `UPLOAD_MODE` | `proxy`（默认）/ `direct` |
+| `DOWNLOAD_MODE` | `proxy`（默认）/ `direct`。`proxy` 每字节都经后端，每次请求重新校验到期/短码/pending；`direct` 只用凭证换取上游签名 URL 后 302，**该 URL 是 bearer 凭证，签发后在自身 `auth_key` 到期前不受撤销（到期、短码失效、清理）影响**。上游对 inline/非 LFS 文件直接返回 body 时自动回退为 proxying。两种模式都先做同一套鉴权 |
 | `MAX_UPLOAD_BYTES` | 10 GiB，可调整；最大 2^50 字节 |
 | `TRANSFER_TIMEOUT` | `30m`，1 秒到 24 小时 |
 | `STORAGE_HOST_SUFFIXES` | `.modelscope.cn,.aliyuncs.com,.amazonaws.com`；仅接受这些边界明确的 HTTPS 主机、443 端口、公共 IP；管理员可添加经过验证的域名。不要放宽为 `.com` |
@@ -88,7 +89,7 @@ Compose 的 Redis 开启 AOF、`appendfsync always`、`noeviction` 并持久化 
 ### 服务状态
 
 - `GET /healthz`：验证 Redis 中本实例仍持有 owner claim。
-- `GET /api/config`：公开 `upload_mode`、`max_upload_bytes`、`inline_limit`，不包含任何凭证。
+- `GET /api/config`：公开 `upload_mode`、`download_mode`、`max_upload_bytes`、`inline_limit`，不包含任何凭证。
 
 ### 浏览器/代理上传
 
@@ -121,7 +122,7 @@ Content-Type: application/json
 2. URL 为空：上游 blob 已存在，可以跳过 PUT。
 3. `POST /api/uploads/{session_id}/complete`：后端再次调用 batch API，只有确认该 blob 不再需要上传才提交并保存记录。
 
-浏览器在 hash 计算后执行上述三步，支持上传进度与各阶段取消；PUT 失败不会请求 complete。取消 complete 等待并不能撤回服务端提交，请通过 hash 查询最终结果；未完成的直传会话在 1 小时后过期。外部上传不携带 Cookie 或 Authorization；仅接受原始签名地址的成功响应，重定向响应不触发 complete。direct 模式的 CSP connect-src 只额外允许 `STORAGE_HOST_SUFFIXES` 中的 HTTPS 主域及子域，proxy 模式仍仅允许同源。浏览器可能在被允许的存储域间跟随重定向，因此这些域必须可信；不要扩大白名单来绕过未知错误。
+浏览器在 hash 计算后执行上述三步，支持上传进度与各阶段取消；PUT 失败不会请求 complete。取消 complete 等待并不能撤回服务端提交，请通过 hash 查询最终结果；未完成的直传会话在 1 小时后过期。外部上传不携带 Cookie 或 Authorization；仅接受原始签名地址的成功响应，重定向响应不触发 complete。direct 模式的 CSP connect-src 只额外允许 `STORAGE_HOST_SUFFIXES` 中的 HTTPS 主域及子域，proxy 模式仍仅允许同源；下载 `direct` 与上传 `direct` 任一开启都会这样放宽。浏览器可能在被允许的存储域间跟随重定向，因此这些域必须可信；不要扩大白名单来绕过未知错误。
 
 direct 不读取文件内容，依赖上游按 oid/size 验证 blob；不像 proxy 自行验证字节。会话 ID 是短时持有者凭证，不能公开。客户端声称完成不作为成功证据。不要在浏览器中尝试用重定向绕过 PUT CORS。
 
@@ -131,13 +132,24 @@ direct 不读取文件内容，依赖上游按 oid/size 验证 blob；不像 pro
 GET /api/files/{hash或短码}
 ```
 
-返回 `{file:{hash,name,size,expires_at,created_at},download_url:"/api/download/<key>"}`。链接由本后端代理、直接下载，不是 token URL。短码查询返回的文件信息含 hash，**因此短码不是对已知 hash 的撤权机制**。
+返回 `{file:{hash,name,size,expires_at,created_at},download_url:"/api/download/<key>"}`。链接由本服务处理：`proxy` 模式直接代理字节，`direct` 模式 302 到上游签名 URL；两种情况都不是 ModelScope token URL。短码查询返回的文件信息含 hash，**因此短码不是对已知 hash 的撤权机制**。
 
 ```http
 GET /api/download/{hash或短码}
 ```
 
-attachment 下载；当前不支持 Range/断点续传。下载持有文件锁到流关闭，在已开始的下载结束后才能清理。链接请求开始时到期就拒绝；已开始传输不会在到期秒数到达时强行中断。文件名安全编码，不回传上游任意响应头。
+attachment 下载；`proxy` 模式当前不支持 Range/断点续传，下载持有文件锁到流关闭，在已开始的下载结束后才能清理。链接请求开始时到期就拒绝；已开始传输不会在到期秒数到达时强行中断。文件名安全编码，不回传上游任意响应头。
+
+`direct` 模式下本服务在完成同一套鉴权后返回 `302`，`Location` 指向上游签名存储地址（`Content-Disposition: attachment; filename=<原文件名>`，含 `Cache-Control: no-store`）。实测行为：
+
+- **不是直连 ModelScope API**：仍需后端先带 token 调一次 API 换取 302，浏览器只访问 CDN 签名 URL（实测 `auth_key` 有效期 ≥20 分钟，上游值而定）。
+- **可去掉仓库信息**：签名只覆盖路径 + `auth_key`，`namespace`/`repository`/`revision`/`tag` 等探测参数会被移除；`filename` 不经签名，改写为真实文件名（路径分隔符/CR/LF/引号/NUL 或其他非法值回退为 hash）。CDN 响应的 `Content-Disposition` 默认只带 hash，不加 `filename` 会让浏览器内联/导航而不是下载。
+- **支持 Range/断点续传**：由 CDN 提供，且带 CORS（`access-control-allow-origin: *`、`allow-methods: GET,OPTIONS`）。
+- **撤销风险**：直接 URL 一经签发就是 bearer 凭证，无法在 `auth_key` 到期前收回。持有者可在链接过期前继续下载，即使本地已到期、短码已失效或文件已被清理。**不要对敏感文件使用 `direct`。** 严格撤权需求只能用 `proxy`。
+- **仅对能签发重定向的文件生效**：inline/非 LFS 文件上游直接返回内容（`200`），此时自动回退为 `proxy` 流式转发，不会额外请求一次。
+- ModelScope 私有仓库同样适用：签名 URL 本身不携带 token，但上游是否会拒发私有内容需实际环境验证。
+
+`direct` 模式同样需要 `STORAGE_HOST_SUFFIXES` 里的 HTTPS 主域/子域能被浏览器访问，CSP `connect-src` 在任一 `direct` 模式下都会放行这些域。
 
 ### 生成短码
 
@@ -178,9 +190,9 @@ ModelScope mutation API 没有 fencing token，Redis 有 TTL 的锁不能阻止�
 
 - 本 MVP **没有账户、权限、访问限速或容量配额**。持有 hash/短码者可以获取文件；hash 不等于登录权限，六位码可枚举。默认只绑定 loopback；上公网前必须通过 TLS 反向代理增加认证、IP/请求速率限制、请求体限制和上传配额。不要公开托管敏感文件。写入接口检查浏览器 Origin，但这不是身份鉴权。
 - 前端开发走 Vite 同源代理；生产反代应保留 Host 和正确的 `X-Forwarded-Proto`。对外代理需清洗客户端伪造的 forwarding 头；后端不应直接暴露。
-- 每实例最多同时处理 16 个 HTTP 请求，包含传输；大文件整体超时默认 30 分钟，小文件 base64 内联会短时占用多份 ≤5 MiB 缓冲。proxy 模式不省带宽，下载同样中转；没有自动全文件重试或断点上传。
-- 存储转发地址只来自经过认证的 ModelScope 响应，不接受客户端传入目标 URL。存储连接二次解析/固定公共 IP，禁用环境 HTTP 代理与自动重定向，凭证仅发给配置的 ModelScope API origin，以及精确匹配 `https://lfs.modelscope.cn` + 配置仓库类型/ID + 预期 SHA-256/大小的标准上传路径。LFS 上传 URL 必须无查询、转义变体或片段，仓库/oid/size 任一不匹配即拒绝；其他 `.modelscope.cn` 上传路径也拒绝。存储域名后缀白名单绝不授权附加 token，OSS 与所有下载重定向均不带认证。白名单外地址、非 HTTPS、未知上传 headers/parameters 或非零 offset 返回错误，不静默降级。已知 batch 的 `upload_header: {"Range":"bytes=0-"}` 是完整上传提示，SDK 同样不依赖传递该 header。
-- 文件过期会尽快从当前仓库树删除；**Git 历史提交、LFS 全局 blob、存储侧缓存可能仍保留内容**。删除不等于不可恢复的物理擦除。文件 hash 或持有的上游签名 URL 不支持撤销；严格数据销毁需求不适合此后端。
+- 每实例最多同时处理 16 个 HTTP 请求，包含传输；大文件整体超时默认 30 分钟，小文件 base64 内联会短时占用多份 ≤5 MiB 缓冲。`UPLOAD_MODE=proxy` 不省上传带宽，`DOWNLOAD_MODE=proxy` 不省下载带宽（均由本服务中转）；`direct` 省的是本服务带宽，不是客户端带宽；没有自动全文件重试或断点上传。
+- 存储转发地址只来自经过认证的 ModelScope 响应，不接受客户端传入目标 URL。存储连接二次解析/固定公共 IP，禁用环境 HTTP 代理与自动重定向，凭证仅发给配置的 ModelScope API origin，以及精确匹配 `https://lfs.modelscope.cn` + 配置仓库类型/ID + 预期 SHA-256/大小的标准上传路径。LFS 上传 URL 必须无查询、转义变体或片段，仓库/oid/size 任一不匹配即拒绝；其他 `.modelscope.cn` 上传路径也拒绝。存储域名后缀白名单绝不授权附加 token，OSS 与所有下载重定向均不带认证。白名单外地址、非 HTTPS、未知上传 headers/parameters 或非零 offset 返回错误，不静默降级。已知 batch 的 `upload_header: {"Range":"bytes=0-"}` 是完整上传提示，SDK 同样不依赖传递该 header。下载 `direct` 下返回的 302 目标同样过 `SafeStorageURL` 白名单，且路径必须包含该文件的完整 hash（路径里的 `/` 先去除，因上游把 hash 拆成 `/89/6f/…`），否则不跳转；`namespace`/`repository`/`revision`/`tag` 等仓库探测参数会被移除，`filename` 经净化后写入（不覆盖签名，但它是上游 `Content-Disposition` 的回显位）。
+- 文件过期会尽快从当前仓库树删除；**Git 历史提交、LFS 全局 blob、存储侧缓存可能仍保留内容**。删除不等于不可恢复的物理擦除。文件 hash 或持有的上游签名 URL 不支持撤销；严格数据销毁需求不适合此后端。`DOWNLOAD_MODE=direct` 会主动把这类签名 URL 交给客户端：签发后到 `auth_key` 过期（实测 ≥20 分钟）前，无法通过到期/短码/清理或任何本地手段收回，也不要指望上游支持撤销。
 - 停机期间过期任务保留，恢复后执行；删除失败文件立即逻辑不可访问，物理删除会延迟。已发出的字节/链接无法收回。
 - 不自动创建仓库，不扫描重建 Redis；Redis 备份不可省略。ModelScope 对私有仓库的具体权限、API 变动、域名及服务配额需实际环境联调。
 
@@ -197,4 +209,4 @@ bun run build
 PLAYWRIGHT_CHROMIUM_EXECUTABLE=/usr/bin/google-chrome bun run test:e2e
 ```
 
-后端包含 miniredis + 模拟 ModelScope 的上传/查询/下载/短码 HTTP smoke，expiry、重复上传、字节校验、失败不登记、清理重试/并发、owner 防重复与停机 drain、direct 确认、SDK wire 格式/凭证隔离测试。回归覆盖真实记录形状的 LFS batch、精确认证范围、直传能力拒绝、mutation 缺失/冲突成功字段时保留 journal，以及 commit/save 跨过文件到期时间。commit/delete 要求显式 `Code:200`（也接受字符串 `"200"`），`Success` 若存在必须为布尔 true；`{}`、`null` 等不算确认成功。真正存储 PUT 的空 2xx 响应与 ModelScope API envelope 分开处理。浏览器测试在模拟 API 下验证真实 Web Worker hash、UI 流程与 CSP，另覆盖短码阶段取消、重复永久文件申请短期上传但生成更长短码、桌面/移动端 select 内容高度；**不代表真实 ModelScope 上传/私有下载/删除已验证**。没有使用真实 token 或执行远端破坏性测试。
+后端包含 miniredis + 模拟 ModelScope 的上传/查询/下载/短码 HTTP smoke，expiry、重复上传、字节校验、失败不登记、清理重试/并发、owner 防重复与停机 drain、direct 上传确认、SDK wire 格式/凭证隔离测试。回归覆盖真实记录形状的 LFS batch、精确认证范围、直传能力拒绝、mutation 缺失/冲突成功字段时保留 journal，以及 commit/save 跨过文件到期时间。下载 `direct` 另有：真实 shape 的 302 解析与探测参数移除、拆分路径 hash 校验、非白名单/跨主机/降级协议/篡改 hash 拒绝、inline 文件回退为 body（不重复请求）、过期仍先被鉴权拒绝、302 的 `Cache-Control: no-store`、以及 CSP 在上传/下载任一 `direct` 时放宽。commit/delete 要求显式 `Code:200`（也接受字符串 `"200"`），`Success` 若存在必须为布尔 true；`{}`、`null` 等不算确认成功。真正存储 PUT 的空 2xx 响应与 ModelScope API envelope 分开处理。浏览器测试在模拟 API 下验证真实 Web Worker hash、UI 流程与 CSP，另覆盖短码阶段取消、重复永久文件申请短期上传但生成更长短码、桌面/移动端 select 内容高度；**不代表真实 ModelScope 上传/私有下载/删除已验证**。没有使用真实 token 或执行远端破坏性测试。

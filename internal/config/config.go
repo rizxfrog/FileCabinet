@@ -15,18 +15,18 @@ import (
 )
 
 type Config struct {
-	Addr, RedisURL, Endpoint, Token, Repo, RepoType, Revision, Namespace, UploadMode string
-	MaxBytes                                                                         int64
-	Timeout                                                                          time.Duration
-	UnsafeDirectExposeURL                                                            bool
-	UploadHosts                                                                      []string
+	Addr, RedisURL, Endpoint, Token, Repo, RepoType, Revision, Namespace, UploadMode, DownloadMode string
+	MaxBytes                                                                                       int64
+	Timeout                                                                                        time.Duration
+	UnsafeDirectExposeURL                                                                          bool
+	UploadHosts                                                                                    []string
 }
 
 func Load() (Config, error) {
 	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
 		return Config{}, fmt.Errorf("read .env: %w", err)
 	}
-	c := Config{Addr: env("LISTEN_ADDR", "127.0.0.1:8080"), RedisURL: env("REDIS_URL", "redis://localhost:6379/0"), Endpoint: env("MODELSCOPE_ENDPOINT", "https://www.modelscope.cn"), Token: os.Getenv("MODELSCOPE_TOKEN"), Repo: os.Getenv("MODELSCOPE_REPO_ID"), RepoType: env("MODELSCOPE_REPO_TYPE", "datasets"), Revision: env("MODELSCOPE_REVISION", "master"), Namespace: env("FILECABINET_NAMESPACE", "00"), UploadMode: env("UPLOAD_MODE", "proxy"), UploadHosts: strings.Split(env("STORAGE_HOST_SUFFIXES", ".modelscope.cn,.aliyuncs.com,.amazonaws.com"), ",")}
+	c := Config{Addr: env("LISTEN_ADDR", "127.0.0.1:8080"), RedisURL: env("REDIS_URL", "redis://localhost:6379/0"), Endpoint: env("MODELSCOPE_ENDPOINT", "https://www.modelscope.cn"), Token: os.Getenv("MODELSCOPE_TOKEN"), Repo: os.Getenv("MODELSCOPE_REPO_ID"), RepoType: env("MODELSCOPE_REPO_TYPE", "datasets"), Revision: env("MODELSCOPE_REVISION", "master"), Namespace: env("FILECABINET_NAMESPACE", "00"), UploadMode: env("UPLOAD_MODE", "proxy"), DownloadMode: env("DOWNLOAD_MODE", "proxy"), UploadHosts: strings.Split(env("STORAGE_HOST_SUFFIXES", ".modelscope.cn,.aliyuncs.com,.amazonaws.com"), ",")}
 	var err error
 	unsafe, parseErr := strconv.ParseBool(env("UNSAFE_DIRECT_EXPOSE_URL", "false"))
 	if parseErr != nil {
@@ -64,6 +64,9 @@ func (c Config) Validate() error {
 	}
 	if c.UploadMode != "proxy" && c.UploadMode != "direct" {
 		return fmt.Errorf("UPLOAD_MODE must be proxy or direct")
+	}
+	if c.DownloadMode != "proxy" && c.DownloadMode != "direct" {
+		return fmt.Errorf("DOWNLOAD_MODE must be proxy or direct")
 	}
 	u, e := url.Parse(c.Endpoint)
 	if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {

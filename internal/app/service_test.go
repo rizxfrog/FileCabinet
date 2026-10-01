@@ -33,6 +33,7 @@ type fakeUpstream struct {
 	failCommit, failDelete, failPut bool
 	uncertainDelete                 bool
 	validateURL                     string
+	directLoc                       string
 	deleteEntered, deleteRelease    chan struct{}
 	content                         []byte
 }
@@ -85,6 +86,18 @@ func (u *fakeUpstream) Delete(context.Context, string) error {
 func (u *fakeUpstream) Download(context.Context, string) (*http.Response, error) {
 	return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(u.content))}, nil
 }
+
+// directLoc is returned as a signed redirect when set; otherwise a 200 body is
+// returned so the caller exercises the inline/proxy fallback without a second call.
+func (u *fakeUpstream) DownloadTarget(context.Context, string, string, string) (string, *http.Response, error) {
+	u.mu.Lock()
+	direct := u.directLoc
+	u.mu.Unlock()
+	if direct != "" {
+		return direct, nil, nil
+	}
+	return "", &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(u.content))}, nil
+}
 func setup(t *testing.T) (*Service, *fakeUpstream, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
@@ -94,7 +107,7 @@ func setup(t *testing.T) (*Service, *fakeUpstream, *miniredis.Miniredis) {
 	if e := s.Claim(context.Background()); e != nil {
 		t.Fatal(e)
 	}
-	c := config.Config{Namespace: "05", UploadMode: "proxy", MaxBytes: 20 << 20, Timeout: time.Second * 10}
+	c := config.Config{Namespace: "05", UploadMode: "proxy", DownloadMode: "proxy", MaxBytes: 20 << 20, Timeout: time.Second * 10}
 	u := &fakeUpstream{}
 	a := New(c, s, u)
 	a.Now = func() time.Time { return time.Unix(1800000000, 0) }
@@ -705,24 +718,92 @@ func TestDirectPrepareRefusesAuthenticatedLFS(t *testing.T) {
 }
 
 func TestUploadModeCSP(t *testing.T) {
-	for _, mode := range []string{"proxy", "direct"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, tc := range []struct{ upload, download string }{
+		{"proxy", "proxy"},
+		{"direct", "proxy"},
+		{"proxy", "direct"},
+		{"direct", "direct"},
+	} {
+		t.Run(tc.upload+"/"+tc.download, func(t *testing.T) {
 			a, _, _ := setup(t)
-			a.C.UploadMode = mode
+			a.C.UploadMode, a.C.DownloadMode = tc.upload, tc.download
 			a.C.UploadHosts = []string{".example.com", ".aliyuncs.com"}
 			rr := httptest.NewRecorder()
 			a.Handler(fstest.MapFS{"index.html": {Data: []byte("UI")}}).ServeHTTP(rr, httptest.NewRequest("GET", "/", nil))
 			csp := rr.Header().Get("Content-Security-Policy")
 			want := "connect-src 'self'"
-			if mode == "direct" {
+			// Either direct mode redirects the browser to storage hosts, so both must widen CSP.
+			if tc.upload == "direct" || tc.download == "direct" {
 				want += " https://example.com https://*.example.com https://aliyuncs.com https://*.aliyuncs.com"
 			}
-			if !strings.Contains(csp, want+";") || strings.Contains(csp, " https:;") || strings.Contains(csp, "https://*") && mode == "proxy" {
+			if !strings.Contains(csp, want+";") || strings.Contains(csp, " https:;") || (tc.upload == "proxy" && tc.download == "proxy") && strings.Contains(csp, "https://*") {
 				t.Fatalf("unexpected CSP: %s", csp)
 			}
 			if !strings.Contains(csp, "frame-ancestors 'none'") || !strings.Contains(csp, "default-src 'self'") {
 				t.Fatal("unrelated CSP protections lost", csp)
 			}
 		})
+	}
+}
+
+// Direct mode must redirect to the signed URL without proxying bytes; the hash-only
+// URL is still a bearer credential, so the response must not be cached.
+func TestDownloadDirectRedirects(t *testing.T) {
+	a, u, _ := setup(t)
+	a.C.DownloadMode = "direct"
+	ctx := context.Background()
+	b := []byte("direct-mode")
+	f := file(b, 0)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	loc := "https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/" + f.Hash + "?auth_key=1"
+	u.directLoc = loc
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/download/"+f.Hash, nil)
+	a.Handler(fstest.MapFS{}).ServeHTTP(rr, req)
+	if rr.Code != 302 || rr.Header().Get("Location") != loc {
+		t.Fatalf("no direct redirect: %d %q %s", rr.Code, rr.Header().Get("Location"), rr.Body.String())
+	}
+	if rr.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("signed URL must not be cached")
+	}
+}
+
+// Non-LFS/inline files come back as a body, so direct mode must fall back to the
+// proxy stream in the same request rather than failing or re-fetching.
+func TestDownloadDirectFallsBackToBody(t *testing.T) {
+	a, _, _ := setup(t)
+	a.C.DownloadMode = "direct"
+	ctx := context.Background()
+	b := []byte("inline-fallback")
+	f := file(b, 0)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	rr := httptest.NewRecorder()
+	a.Handler(fstest.MapFS{}).ServeHTTP(rr, httptest.NewRequest("GET", "/api/download/"+f.Hash, nil))
+	if rr.Code != 200 || !bytes.Equal(rr.Body.Bytes(), b) {
+		t.Fatalf("fallback failed: %d %q", rr.Code, rr.Body.String())
+	}
+}
+
+// Expiry, short-code validity and the pending journal must still gate direct mode:
+// authorization runs before upstream is asked for a URL.
+func TestDownloadDirectStillAuthorizes(t *testing.T) {
+	a, u, _ := setup(t)
+	a.C.DownloadMode = "direct"
+	u.directLoc = "https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/x?auth_key=1"
+	ctx := context.Background()
+	b := []byte("expired-direct")
+	f := file(b, a.Now().Unix()+1)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	a.Now = func() time.Time { return time.Unix(f.ExpiresAt+1, 0) }
+	rr := httptest.NewRecorder()
+	a.Handler(fstest.MapFS{}).ServeHTTP(rr, httptest.NewRequest("GET", "/api/download/"+f.Hash, nil))
+	if rr.Code != 404 {
+		t.Fatalf("expired direct download allowed: %d %s", rr.Code, rr.Body.String())
 	}
 }
