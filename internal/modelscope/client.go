@@ -304,18 +304,25 @@ func (c *Client) ReadFile(ctx context.Context, path string) ([]byte, error) {
 }
 
 // Commit writes the blob pointer and, when metaPath is set, the meta file in a single
-// commit, so a stored file never becomes visible without its metadata.
+// commit, so a stored file never becomes visible without its metadata. An empty path
+// commits the document alone, which is how a file list is stored: it has no blob.
 func (c *Client) Commit(ctx context.Context, path, metaPath, hash string, size int64, content, meta []byte) error {
-	op := map[string]any{"action": "create", "path": path, "type": "lfs", "size": size, "sha256": hash, "content": "", "encoding": ""}
-	if size <= InlineLimit {
-		op["type"] = "normal"
-		op["sha256"] = ""
-		op["content"] = base64.StdEncoding.EncodeToString(content)
-		op["encoding"] = "base64"
+	var actions []any
+	if path != "" {
+		op := map[string]any{"action": "create", "path": path, "type": "lfs", "size": size, "sha256": hash, "content": "", "encoding": ""}
+		if size <= InlineLimit {
+			op["type"] = "normal"
+			op["sha256"] = ""
+			op["content"] = base64.StdEncoding.EncodeToString(content)
+			op["encoding"] = "base64"
+		}
+		actions = append(actions, op)
 	}
-	actions := []any{op}
 	if metaPath != "" {
 		actions = append(actions, normalAction(metaPath, meta))
+	}
+	if len(actions) == 0 {
+		return nil
 	}
 	err := c.json(ctx, "POST", "repos/"+c.C.RepoType+"/"+c.C.Repo+"/commit/"+url.PathEscape(c.C.Revision), map[string]any{"commit_message": "FileCabinet store " + hash, "actions": actions}, nil)
 	if err != nil {

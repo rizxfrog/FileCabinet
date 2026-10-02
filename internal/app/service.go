@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -71,21 +73,33 @@ func (a *Service) MetaPath(h string) string {
 	return a.C.Namespace + "/meta/" + h[:2] + "/" + h[2:] + ".json"
 }
 
-// fileMeta is the committed record. It is intentionally minimal and forward compatible:
-// unknown fields in a stored document are ignored, and FileName is the only field today.
-// Size has no omitempty: it is also the marker that distinguishes a real document from
-// arbitrary bytes served at the same path, so an empty file must still record 0.
-type fileMeta struct {
-	FileName string `json:"file_name"`
-	Size     int64  `json:"size"`
+// Meta document kinds. A document without a recognised kind is not a FileCabinet
+// record, which keeps an unrelated repository file at the same path from being adopted.
+const (
+	kindFile = "file"
+	kindList = "file-list"
+	// listLimit bounds a file list. The index is one commit and every entry costs a
+	// metadata read on lookup, so an unbounded list would let one document fan out into
+	// arbitrarily many upstream requests.
+	listLimit = 1000
+)
+
+// metaDoc is the committed metadata document for both kinds. File-list entries are
+// hashes only: names and sizes are read from each entry's own document, so a list never
+// duplicates data that can drift from its source.
+type metaDoc struct {
+	Type     string   `json:"type"`
+	Name     string   `json:"name"`
+	Size     int64    `json:"size"`
+	FileList []string `json:"file-list,omitempty"`
 }
 
-// metaFor encodes the meta document written alongside the blob. Only a name that passed
-// ValidateFile is stored; a name equal to the hash means "no name was supplied".
+// metaFor encodes the document written alongside an uploaded blob. Only a name that
+// passed ValidateFile is stored; a name equal to the hash means "no name was supplied".
 func metaFor(f store.File) []byte {
-	m := fileMeta{Size: f.Size}
+	m := metaDoc{Type: kindFile, Size: f.Size}
 	if f.Name != "" && f.Name != f.Hash {
-		m.FileName = f.Name
+		m.Name = f.Name
 	}
 	b, e := json.Marshal(m)
 	if e != nil {
@@ -94,40 +108,57 @@ func metaFor(f store.File) []byte {
 	return b
 }
 
-// parseMeta decodes a committed meta document. ok is false when the bytes are not a
-// FileCabinet document at all, which keeps an unrelated repository file from being
-// mistaken for metadata.
-func parseMeta(b []byte) (name string, size int64, ok bool) {
-	var raw map[string]json.RawMessage
-	if json.Unmarshal(b, &raw) != nil {
-		return "", 0, false
+// listFor encodes the document for a file list. Size is the total of the entries the
+// caller resolved; the list itself stores no bytes.
+func listFor(name string, size int64, hashes []string) []byte {
+	m := metaDoc{Type: kindList, Name: name, Size: size, FileList: hashes}
+	b, e := json.Marshal(m)
+	if e != nil {
+		return nil
 	}
-	if _, present := raw["size"]; !present {
-		return "", 0, false
-	}
-	var m fileMeta
+	return b
+}
+
+// parseMeta decodes a committed document into a record. ok is false when the bytes are
+// not a FileCabinet document, or when a list violates the invariants a writer must
+// uphold (non-positive total size, or non-hash entries): a corrupt index is treated as
+// absent rather than surfaced as a half-usable record.
+func parseMeta(b []byte) (f store.File, hashes []string, ok bool) {
+	var m metaDoc
 	if json.Unmarshal(b, &m) != nil || m.Size < 0 {
-		return "", 0, false
+		return store.File{}, nil, false
 	}
-	if !validName(m.FileName) {
-		return "", m.Size, true
+	switch m.Type {
+	case kindFile:
+		if !validName(m.Name) {
+			m.Name = ""
+		}
+		return store.File{Name: m.Name, Size: m.Size}, nil, true
+	case kindList:
+		if len(m.FileList) == 0 || len(m.FileList) > listLimit || m.Size <= 0 || !validName(m.Name) {
+			return store.File{}, nil, false
+		}
+		for _, h := range m.FileList {
+			if !HashValid(h) {
+				return store.File{}, nil, false
+			}
+		}
+		return store.File{Name: m.Name, Size: m.Size}, m.FileList, true
 	}
-	return m.FileName, m.Size, true
+	return store.File{}, nil, false
 }
 
 func validName(name string) bool {
 	return name != "" && len(name) <= 255 && utf8.ValidString(name) && !strings.ContainsAny(name, "\r\n\x00/\\")
 }
 
-// metaName reads the committed name for a hash. Absence, a truncated document or a
-// decode failure all yield "" so callers keep the name they already have.
-func (a *Service) metaName(ctx context.Context, h string) string {
+// readMeta returns the document for a hash, or ok=false when it is absent or unusable.
+func (a *Service) readMeta(ctx context.Context, h string) (store.File, []string, bool) {
 	b, e := a.U.ReadFile(ctx, a.MetaPath(h))
 	if e != nil || len(b) == 0 {
-		return ""
+		return store.File{}, nil, false
 	}
-	name, _, _ := parseMeta(b)
-	return name
+	return parseMeta(b)
 }
 func active(f store.File, now int64) bool { return f.ExpiresAt == 0 || f.ExpiresAt > now }
 func MergeExpiry(old, new int64) int64 {
@@ -341,37 +372,162 @@ func (a *Service) Resolve(ctx context.Context, key string) (store.File, error) {
 	if !active(f, a.Now().Unix()) {
 		return store.File{}, store.ErrMissing
 	}
-	// The committed meta document is the durable source of the name; Redis carries the
-	// authoritative lifetime. A failing meta read must not make the file unavailable.
-	if name := a.metaName(ctx, h); name != "" {
-		f.Name = name
+	// The committed document is the durable source of the name; Redis carries the
+	// authoritative lifetime. A failing read must not make the entry unavailable.
+	if doc, _, ok := a.readMeta(ctx, h); ok && doc.Name != "" {
+		f.Name = doc.Name
 	}
 	return f, nil
 }
 
-// recover reconstructs a record when Redis has no entry for the hash, using the meta
-// document committed beside the blob. It is limited to files this service committed:
-// the document must parse as a FileCabinet meta record, which keeps an unrelated
-// repository file at the same path from being adopted. Whether the blob still exists is
-// decided by the caller's subsequent download, so a dangling document cannot fabricate
-// an available file.
+// recover reconstructs a record when Redis has no entry for the hash, using the
+// committed metadata document. It is limited to entries this service committed: the
+// document must carry a recognised kind, which keeps an unrelated repository file at the
+// same path from being adopted. Whether a blob still exists is decided by the caller's
+// subsequent download, so a dangling document cannot fabricate an available file.
 //
 // The returned record has no expiry: Redis held the only copy of that deadline, so the
-// file is treated as permanent until the upload is repeated.
+// entry is treated as permanent until the upload is repeated.
 func (a *Service) recover(ctx context.Context, h string) (store.File, error) {
-	b, e := a.U.ReadFile(ctx, a.MetaPath(h))
-	if e != nil {
-		return store.File{}, e
-	}
-	name, size, ok := parseMeta(b)
-	if !ok || size > a.C.MaxBytes {
+	doc, _, ok := a.readMeta(ctx, h)
+	if !ok || doc.Size > a.C.MaxBytes {
 		return store.File{}, store.ErrMissing
 	}
+	name := doc.Name
 	if name == "" {
 		name = h
 	}
-	return store.File{Hash: h, Name: name, Size: size}, nil
+	return store.File{Hash: h, Name: name, Size: doc.Size}, nil
 }
+
+// ListEntry is one member of a file list. Entries carry the name and size read from the
+// entry's own document, so the index never duplicates data that can drift.
+type ListEntry struct {
+	Hash string `json:"hash"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+// CreateList commits an index document that points at existing files.
+//
+// The list itself stores no bytes, so it cannot go through Upload: its hash is the
+// SHA-256 of the document, not of a blob. Entry hashes must already exist, so a list can
+// only ever reference content that is genuinely stored — this deliberately does not
+// verify reachability beyond the committed document, which would cost one read per entry.
+func (a *Service) CreateList(ctx context.Context, name string, hashes []string) (store.File, error) {
+	if !validName(name) {
+		return store.File{}, fmt.Errorf("%w：列表名称无效", ErrInvalid)
+	}
+	if len(hashes) == 0 {
+		return store.File{}, fmt.Errorf("%w：文件列表不能为空", ErrInvalid)
+	}
+	if len(hashes) > listLimit {
+		return store.File{}, fmt.Errorf("%w：文件列表最多 %d 项", ErrInvalid, listLimit)
+	}
+	seen := make(map[string]bool, len(hashes))
+	var total int64
+	// Every entry must resolve to a plain file. Rejecting a nested list keeps indexing
+	// acyclic, and rejecting duplicates keeps the total a sum of distinct content.
+	for _, h := range hashes {
+		if !HashValid(h) {
+			return store.File{}, fmt.Errorf("%w：文件列表包含无效 hash", ErrInvalid)
+		}
+		if seen[h] {
+			return store.File{}, fmt.Errorf("%w：文件列表包含重复项", ErrInvalid)
+		}
+		seen[h] = true
+		doc, nested, ok := a.readMeta(ctx, h)
+		if !ok {
+			return store.File{}, fmt.Errorf("%w：文件列表包含不存在的文件", ErrInvalid)
+		}
+		if len(nested) > 0 {
+			return store.File{}, fmt.Errorf("%w：文件列表不能包含文件列表", ErrInvalid)
+		}
+		total += doc.Size
+	}
+	doc := listFor(name, total, hashes)
+	sum := sha256.Sum256(doc)
+	hash := hex.EncodeToString(sum[:])
+	unlock, e := a.lock(ctx, hash)
+	if e != nil {
+		return store.File{}, e
+	}
+	defer unlock()
+	if e = a.ready(ctx, hash); e != nil {
+		return store.File{}, e
+	}
+	// A list hash is derived from its content, so re-creating an identical list is a
+	// no-op. The document is still written when only Redis lacks the record, which keeps
+	// the fix correct after a lost database.
+	existing, err := a.S.Get(ctx, hash)
+	if err == nil && active(existing, a.Now().Unix()) && existing.Size == total {
+		return existing, nil
+	}
+	if err != nil && !errors.Is(err, store.ErrMissing) {
+		return store.File{}, err
+	}
+	if e = a.S.Mark(ctx, hash, "commit"); e != nil {
+		a.Uncertain.Store(true)
+		return store.File{}, e
+	}
+	if e = a.U.Commit(ctx, "", a.MetaPath(hash), hash, total, nil, doc); e != nil {
+		return store.File{}, e
+	}
+	f := store.File{Hash: hash, Name: name, Size: total, CreatedAt: a.Now().Unix()}
+	if e = a.S.Save(ctx, f); e != nil {
+		a.Uncertain.Store(true)
+		return f, e
+	}
+	return f, nil
+}
+
+// Describe expands a key into either a file or an index whose entries carry their own
+// names and sizes. Entry metadata is read concurrently and bounded; a single unusable
+// entry fails the whole description rather than reporting a partial list. The returned
+// keys are the entry hashes in document order, for callers that download them.
+func (a *Service) Describe(ctx context.Context, key string) (store.File, []ListEntry, error) {
+	f, e := a.Resolve(ctx, key)
+	if e != nil {
+		return f, nil, e
+	}
+	_, hashes, ok := a.readMeta(ctx, f.Hash)
+	if !ok || len(hashes) == 0 {
+		return f, nil, nil
+	}
+	entries := make([]ListEntry, len(hashes))
+	limit := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	var firstErr error
+	var mu sync.Mutex
+	for i, h := range hashes {
+		wg.Add(1)
+		limit <- struct{}{}
+		go func(i int, h string) {
+			defer wg.Done()
+			defer func() { <-limit }()
+			doc, _, ok := a.readMeta(ctx, h)
+			if !ok {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%w：文件列表项不可用", ErrInvalid)
+				}
+				mu.Unlock()
+				return
+			}
+			name := doc.Name
+			if name == "" {
+				name = h
+			}
+			entries[i] = ListEntry{Hash: h, Name: name, Size: doc.Size}
+		}(i, h)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return f, nil, firstErr
+	}
+	return f, entries, nil
+}
+
 func (a *Service) NewCode(ctx context.Context, h string, expiry int64) (store.Code, error) {
 	var c store.Code
 	if !HashValid(h) {
@@ -484,11 +640,15 @@ func (a *Service) Cleanup(ctx context.Context) error {
 				return
 			}
 			if e = a.deleteLocked(ctx, f); e != nil {
+				// The flag is set before any journal write so an unreachable Redis cannot
+				// crash the loop with a sticky bit that never got published: main decides
+				// whether to keep the owner based on it.
+				a.Uncertain.Store(true)
 				first = e
 				retryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				defer cancel()
 				if e = a.S.Retry(retryCtx, h, a.Now().Unix()+60); e != nil {
-					a.Uncertain.Store(true)
+					slog.Warn("cleanup retry not rescheduled", "hash", h)
 				}
 			}
 		}()

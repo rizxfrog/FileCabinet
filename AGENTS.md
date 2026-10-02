@@ -8,11 +8,17 @@ compiled into the same binary. Module `FileCabinet`, Go 1.24.
 
 - Key = SHA-256 of file content. Clients compute the hash; the service stores bytes
   under `namespace/<hash[:2]>/<hash[2:]>` in a configured ModelScope repo.
-- Each file also gets a committed JSON metadata document at
-  `namespace/meta/<hash[:2]>/<hash[2:]>.json` holding `file_name` and `size`. It is
-  written in the same commit as the blob pointer, is the authoritative source of the
-  name on read, and lets a lookup rebuild a record when the Redis entry is gone
-  (recovered records have no expiry).
+- Each entry also gets a committed JSON metadata document at
+  `namespace/meta/<hash[:2]>/<hash[2:]>.json`, typed as
+  `{"type":"file","name":…,"size":…}`. It is written in the same commit as the blob
+  pointer, is the authoritative source of the name on read, and lets a lookup rebuild a
+  record when the Redis entry is gone (recovered records have no expiry).
+- A **file list** is an index-only document at the same path with
+  `{"type":"file-list","name":…,"size":<sum of members>,"file-list":[<hash>,…]}`; its hash
+  is `sha256(document bytes)` and it stores no blob. Members must be existing plain
+  files, not lists, and unique (1–1000). `POST /api/lists` creates one;
+  `GET /api/files/{key}` answers `{file,list:[{hash,name,size}]}` instead of
+  `download_url` when the key is a list.
 - Metadata, short codes, expiry index and upload sessions live in Redis; Redis also
   gates single-instance ownership.
 - Two modes per direction: `UPLOAD_MODE` and `DOWNLOAD_MODE`, each `proxy` (default,
@@ -148,8 +154,9 @@ automatically, so run `gofmt -l .` and `go vet ./...` manually before yielding.
 
 HTTP routes (all registered in `Service.Handler`):
 `GET /healthz`, `GET /api/config`, `PUT /api/files/{hash}`, `GET /api/files/{key}`,
-`POST /api/codes`, `POST /api/uploads/prepare`, `POST /api/uploads/{id}/complete`,
-`GET /api/download/{key}`, JSON 404 under `/api/`, embedded UI on `/`.
+`POST /api/codes`, `POST /api/lists`, `POST /api/uploads/prepare`,
+`POST /api/uploads/{id}/complete`, `GET /api/download/{key}`, JSON 404 under `/api/`,
+embedded UI on `/`.
 
 ## Runtime/Tooling Preferences
 

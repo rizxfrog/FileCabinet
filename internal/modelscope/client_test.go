@@ -572,3 +572,38 @@ func TestReadFileFollowsStorageRedirect(t *testing.T) {
 		t.Fatal("absent path", b, e)
 	}
 }
+
+// A file list has no blob: the commit must carry the document alone, and an empty commit
+// must not be sent at all.
+func TestCommitWithoutBlobSendsDocumentOnly(t *testing.T) {
+	var bodies []map[string]any
+	c := New(config.Config{Endpoint: "https://www.modelscope.cn", Repo: "o/r", RepoType: "datasets", Revision: "master"})
+	c.API = &http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
+		var b map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		bodies = append(bodies, b)
+		return response(`{"Code":200,"Success":true}`), nil
+	})}
+	doc := []byte(`{"type":"file-list","name":"l","size":3,"file-list":[]}`)
+	if e := c.Commit(context.Background(), "", "00/meta/aa/x.json", strings.Repeat("a", 64), 3, nil, doc); e != nil {
+		t.Fatal(e)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("expected one commit, got %d", len(bodies))
+	}
+	acts := bodies[0]["actions"].([]any)
+	if len(acts) != 1 {
+		t.Fatalf("list commit must carry exactly the document: %v", acts)
+	}
+	a := acts[0].(map[string]any)
+	if a["path"] != "00/meta/aa/x.json" || a["type"] != "normal" {
+		t.Fatalf("wrong action: %v", a)
+	}
+	// Nothing to write at all -> no request.
+	if e := c.Commit(context.Background(), "", "", "", 0, nil, nil); e != nil {
+		t.Fatal(e)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("empty commit was sent: %v", bodies)
+	}
+}

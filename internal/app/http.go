@@ -110,12 +110,34 @@ func (a *Service) Handler(assets fs.FS) http.Handler {
 	})
 	mux.HandleFunc("GET /api/files/{key}", func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
-		f, e := a.Resolve(r.Context(), key)
+		f, entries, e := a.Describe(r.Context(), key)
 		if e != nil {
 			fail(w, e)
 			return
 		}
-		reply(w, 200, map[string]any{"file": f, "download_url": "/api/download/" + key})
+		out := map[string]any{"file": f}
+		if entries == nil {
+			out["download_url"] = "/api/download/" + key
+		} else {
+			out["list"] = entries
+		}
+		reply(w, 200, out)
+	})
+	mux.HandleFunc("POST /api/lists", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Name string   `json:"name"`
+			List []string `json:"file-list"`
+		}
+		if e := decode(w, r, &body); e != nil {
+			fail(w, e)
+			return
+		}
+		f, e := a.CreateList(r.Context(), body.Name, body.List)
+		if e != nil {
+			fail(w, e)
+			return
+		}
+		reply(w, 201, f)
 	})
 	mux.HandleFunc("POST /api/codes", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {

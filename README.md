@@ -9,7 +9,7 @@
 - 上传/下载都有 `proxy`/`direct` 两档。下载 `direct` 下只用凭证换取上游签名 URL 后 302，字节不经过本服务（代价是该 URL 在自身 `auth_key` 到期前无法撤销）；上传 `direct` 的申请、直传、完成接口仅在上游返回真正的免 token 签名 URL 或 blob 已存在时可用，当前 ModelScope LFS 返回需认证的 API URL，申请新 blob 直传会明确拒绝（422），应使用 `UPLOAD_MODE=proxy`。原生客户端不受 CORS 限制不等于免认证；浏览器需要上游允许 CORS（或仅在测试时使用 Allow CORS 插件），插件不解决鉴权，小文件仍走内联接口。**不包含 CLI，不下发 ModelScope token。**
 - 文件默认永久；1h / 1d / 7d / 自定义绝对到期时间。重复内容只延长有效期，永久优先。proxy 重复上传仍读取并校验传入内容，避免声明 hash 绕过内容校验。
 - 六位数字短码；本次首次数字冲突后改试六位大小写字母与数字混合，Redis SET NX 原子占位。默认到期 `min(文件到期, 当前时间+7天)`；自定义必须未来且严格早于默认值。文件到期后不能生成/使用短码。
-- 下载查询返回本服务相对链接。`proxy` 模式由后端携带凭证请求 ModelScope、跟随受限存储重定向时不携带凭证并中转字节；`direct` 模式只用凭证换取上游签名直链后 302 给浏览器，字节不经过本服务。文件不会在页面公开列出。
+- 下载查询返回本服务相对链接。`proxy` 模式由后端携带凭证请求 ModelScope、跟随受限存储重定向时不携带凭证并中转字节；`direct` 模式只用凭证换取上游签名直链后 302 给浏览器，字节不经过本服务。文件不会在页面公开列出。查询到文件列表时返回成员清单（名称/大小由各自 meta 补全），可逐个下载。
 - 元数据无 TTL，Redis sorted set 保留清理任务；短码和直传会话才使用 TTL。每 30 秒清理最多 100 项，明确拒绝的失败后 60 秒重试；超时/5xx 等未知结果隔离待人工核对；同一文件的上传/续期/删除/下载在锁内串行。
 
 ## 先决条件与启动
@@ -35,7 +35,7 @@ go run .
 cd ../FileCabinetFront
 bun install --frozen-lockfile
 bun run dev
-# 打开 http://127.0.0.1:5173，Vite 同源代理 /api 到 8080
+# 打开 http://127.0.0.1:5173，Vite 同源代理 /api 到 6499
 ```
 
 后端初次运行前 `public/` 已包含生成 UI；修改前端后运行：
@@ -84,18 +84,33 @@ Compose 的 Redis 开启 AOF、`appendfsync always`、`noeviction` 并持久化 
 
 ### 文件元数据（meta）
 
-每个文件在提交时同时写入一个文本 meta 文件，与 blob 指针在同一次 commit 中落地，因此不会出现"文件可见但没有文件名"的中间态：
+每个条目在提交时写入一个文本 meta 文件；文件与其 meta 在同一次 commit 中落地，因此不会出现"可见但没有元数据"的中间态：
 
 ```text
 00/meta/ac/ac3c56ad1d336649b38b4ced877e1f45ef6d78cf1d62feba56c991db93b63b24.json
-{"file_name":"高等数学1.zip","size":351939402}
+{"type":"file","name":"高等数学1.zip","size":351939402}
 ```
 
-- **名字的权威来源是仓库**：`GET /api/files/{key}` 与下载都会读取 meta 并把其中的 `file_name` 作为对外文件名，Redis 中的 `name` 仅作回退（meta 缺失、读取失败或字段非法时沿用）。读取失败不会让文件不可用。
-- **`size` 必填**，既是重建记录所需，也是"这确实是 FileCabinet 文档"的标记：路径上凑巧存在的其他 JSON 不会被当成元数据采用；`file_name` 非法（含 `/`、`\`、CR/LF/NUL 或超过 255 字节）时只丢弃名字、回退为 hash，文件仍可下载。
-- **Redis 记录丢失后可重建**：hash 是内容寻址的，meta 路径可由 hash 推导。当 Redis 无该文件记录时，服务读取 meta 恢复 `name`/`size` 并允许查询与下载。此时 **`expires_at` 为 0（视为永久）**：到期时间是 Redis 独有的信息，无法从仓库恢复，需要重新上传才能恢复原有效期。未持有 hash 的调用方无法枚举此路径。
+- **`type` 区分条目种类**：`file` 为普通文件，`file-list` 为文件列表。缺少或无法识别的 `type` 不算 FileCabinet 文档，路径上凑巧存在的其他 JSON 不会被采用。
+- **名字的权威来源是仓库**：`GET /api/files/{key}` 与下载都会读取 meta 并把其中的 `name` 作为对外文件名，Redis 的 `name` 仅作回退（meta 缺失、读取失败或字段非法时沿用）。读取失败不会让文件不可用。`name` 非法（含 `/`、`\`、CR/LF/NUL 或超 255 字节）时只丢弃名字、回退为 hash。
+- **Redis 记录丢失后可重建**：hash 是内容寻址的，meta 路径可由 hash 推导。Redis 无记录时用 meta 恢复 `name`/`size` 并允许查询与下载。此时 **`expires_at` 为 0（视为永久）**：到期时间只存在于 Redis，无法从仓库恢复，需重新上传才能恢复原有效期。未持有 hash 者无法枚举该路径。
 - **清理会一并删除 meta**；若 meta 尚不存在而被删（例如升级前入库的文件），只删除 blob。
-- 后续可在同一文档中扩展字段（未知字段在读取时被忽略），因此新增元数据不需要改动旧记录。
+
+### 文件列表（file-list）
+
+列表是**纯索引文档**，指向已存在的文件，本身不存字节：
+
+```text
+00/meta/66/390bb9b495f00892bfdc90c6ee52f88bcf6a438e5e36532a77570d97488609.json
+{"type":"file-list","name":"各版本高等数学备份","size":1380,"file-list":["<64位 hash>", "..."]}
+```
+
+- **列表 hash = `sha256(该 json 的字节)`**，与其他条目一样落在 `namespace/meta/` 下，因此客户端可用任意 SHA-256 工具复算校验；由于不存字节，列表不能通过 `PUT /api/files/{hash}` 上传，必须走 `POST /api/lists`。
+- **`size` 是各成员大小之和**，由服务端按每个成员自己的 meta 累加，不接受客户端声明。
+- **约束**：成员必须是已存在的普通文件；不允许嵌套列表（索引保持无环）、不允许重复项；1–1000 项；名称规则与文件名相同。违反均返回 400。
+- **查询列表**返回 `{"file":{...},"list":[{"hash":..,"name":..,"size":..}]}`（无 `download_url`），成员名与大小由服务端读取各自 meta 补全；普通文件仍返回 `{"file":{...},"download_url":..}`。任一成员不可用时整次查询失败，不会给出半个列表。
+- **列表本身不可下载**（没有对应 blob）；成员可逐个下载。前端「下载列表」按钮依次触发每个成员的下载（浏览器对并发下载有节流，故串行且带间隔）。
+
 
 ## API
 
@@ -105,6 +120,7 @@ Compose 的 Redis 开启 AOF、`appendfsync always`、`noeviction` 并持久化 
 
 - `GET /healthz`：验证 Redis 中本实例仍持有 owner claim。
 - `GET /api/config`：公开 `upload_mode`、`download_mode`、`max_upload_bytes`、`inline_limit`，不包含任何凭证。
+- `POST /api/lists`：创建文件列表（纯索引，不存字节）。
 
 ### 浏览器/代理上传
 
@@ -148,6 +164,19 @@ GET /api/files/{hash或短码}
 ```
 
 返回 `{file:{hash,name,size,expires_at,created_at},download_url:"/api/download/<key>"}`。链接由本服务处理：`proxy` 模式直接代理字节，`direct` 模式 302 到上游签名 URL；两种情况都不是 ModelScope token URL。短码查询返回的文件信息含 hash，**因此短码不是对已知 hash 的撤权机制**。
+
+如果该 key 指向的是文件列表，则改为返回 `{file:{...},list:[{hash,name,size},...]}`（无 `download_url`）：成员名与大小由服务端读取各自 meta 补全，任一成员不可用则整次查询失败。列表没有 blob，因此不能下载，只能逐个下载成员。
+
+### 创建文件列表
+
+```http
+POST /api/lists
+Content-Type: application/json
+
+{"name":"各版本高等数学备份","file-list":["<sha256>","<sha256>"]}
+```
+
+201 返回 `{hash,name,size,expires_at,created_at}`，其中 `hash = sha256(meta 文档字节)`、`size` 为成员大小之和（服务端累加，不接受声明）。成员必须已存在、非列表、不重复，1–1000 项；不满足返回 400。重复创建同一列表是幂等操作（内容相同则 hash 相同）。
 
 ```http
 GET /api/download/{hash或短码}
@@ -225,4 +254,4 @@ bun run build
 PLAYWRIGHT_CHROMIUM_EXECUTABLE=/usr/bin/google-chrome bun run test:e2e
 ```
 
-后端包含 miniredis + 模拟 ModelScope 的上传/查询/下载/短码 HTTP smoke，expiry、重复上传、字节校验、失败不登记、清理重试/并发、owner 防重复与停机 drain、direct 上传确认、SDK wire 格式/凭证隔离测试。回归覆盖真实记录形状的 LFS batch、精确认证范围、直传能力拒绝、mutation 缺失/冲突成功字段时保留 journal，以及 commit/save 跨过文件到期时间。下载 `direct` 另有：真实 shape 的 302 解析与探测参数移除、拆分路径 hash 校验、非白名单/跨主机/降级协议/篡改 hash 拒绝、inline 文件回退为 body（不重复请求）、过期仍先被鉴权拒绝、302 的 `Cache-Control: no-store`、以及 CSP 在上传/下载任一 `direct` 时放宽。commit/delete 要求显式 `Code:200`（也接受字符串 `"200"`），`Success` 若存在必须为布尔 true；`{}`、`null` 等不算确认成功。真正存储 PUT 的空 2xx 响应与 ModelScope API envelope 分开处理。浏览器测试在模拟 API 下验证真实 Web Worker hash、UI 流程与 CSP，另覆盖短码阶段取消、重复永久文件申请短期上传但生成更长短码、桌面/移动端 select 内容高度；**不代表真实 ModelScope 上传/私有下载/删除已验证**。没有使用真实 token 或执行远端破坏性测试。
+后端包含 miniredis + 模拟 ModelScope 的上传/查询/下载/短码 HTTP smoke，expiry、重复上传、字节校验、失败不登记、清理重试/并发、owner 防重复与停机 drain、direct 上传确认、SDK wire 格式/凭证隔离测试。回归覆盖真实记录形状的 LFS batch、精确认证范围、直传能力拒绝、mutation 缺失/冲突成功字段时保留 journal，以及 commit/save 跨过文件到期时间。下载 `direct` 另有：真实 shape 的 302 解析与探测参数移除、拆分路径 hash 校验、非白名单/跨主机/降级协议/篡改 hash 拒绝、inline 文件回退为 body（不重复请求）、过期仍先被鉴权拒绝、302 的 `Cache-Control: no-store`、以及 CSP 在上传/下载任一 `direct` 时放宽。meta 与文件列表另有：列表 hash = sha256(文档字节) 且不写 blob、成员名/大小按各自 meta 补全、成员不存在/重复/嵌套列表/超 1000 项被拒、无 blob 的提交只发送文档、外来 JSON 不被当作元数据、空文件记录仍有效、Redis 记录删除后由 meta 恢复并可下载、meta 读取失败降级为 Redis 名字、清理同时删除 meta、仓库文件读取跟随 allowlist 重定向且不带凭证、删除跳过不存在的路径。commit/delete 要求显式 `Code:200`（也接受字符串 `"200"`），`Success` 若存在必须为布尔 true；`{}`、`null` 等不算确认成功。真正存储 PUT 的空 2xx 响应与 ModelScope API envelope 分开处理。浏览器测试在模拟 API 下验证真实 Web Worker hash、UI 流程与 CSP，另覆盖短码阶段取消、重复永久文件申请短期上传但生成更长短码、桌面/移动端 select 内容高度；**不代表真实 ModelScope 上传/私有下载/删除已验证**。没有使用真实 token 或执行远端破坏性测试。

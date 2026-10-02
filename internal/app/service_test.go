@@ -921,15 +921,25 @@ func TestRecoverRejectsForeignContent(t *testing.T) {
 	a, u, _ := setup(t)
 	ctx := context.Background()
 	h := strings.Repeat("c", 64)
-	for _, body := range []string{"", "not json", `{"message":"nope"}`, `{"size":"x"}`, `{"size":-1}`} {
+	// No type, an unknown type, a bad size, a list that violates its invariants: none of
+	// these are FileCabinet records.
+	for _, body := range []string{
+		"", "not json", `{"message":"nope"}`,
+		`{"name":"x","size":7}`,
+		`{"type":"other","name":"x","size":7}`,
+		`{"type":"file","size":"x"}`, `{"type":"file","size":-1}`,
+		`{"type":"file-list","name":"l","size":0,"file-list":["` + h + `"]}`,
+		`{"type":"file-list","name":"l","size":7,"file-list":[]}`,
+		`{"type":"file-list","name":"l","size":7,"file-list":["nope"]}`,
+	} {
 		u.files = map[string][]byte{a.MetaPath(h): []byte(body)}
 		if _, e := a.Resolve(ctx, h); !errors.Is(e, store.ErrMissing) {
 			t.Fatalf("adopted %q: %v", body, e)
 		}
 	}
-	// A record with an unusable or empty name still recovers; only the size is load
-	// bearing, and the name falls back to the hash rather than discarding the file.
-	for _, body := range []string{`{"file_name":"","size":7}`, `{"file_name":"a/b.txt","size":7}`, `{"size":7}`} {
+	// A file record with an unusable or absent name still recovers; the name falls back
+	// to the hash rather than discarding the entry.
+	for _, body := range []string{`{"type":"file","name":"","size":7}`, `{"type":"file","name":"a/b.txt","size":7}`, `{"type":"file","size":7}`} {
 		u.files = map[string][]byte{a.MetaPath(h): []byte(body)}
 		got, e := a.Resolve(ctx, h)
 		if e != nil || got.Name != h || got.Size != 7 {
@@ -980,5 +990,106 @@ func TestCleanupRemovesMetaAndEmptyFileRoundTrips(t *testing.T) {
 	}
 	if p, _ := a.S.Pending(ctx, empty.Hash); p != "" {
 		t.Fatalf("journal not cleared: %q", p)
+	}
+}
+
+// A file list is committed as an index document only: no blob, hash derived from the
+// document, and the total is the real sum of its entries.
+func TestCreateListCommitsIndexDocument(t *testing.T) {
+	a, u, _ := setup(t)
+	u.files = map[string][]byte{}
+	ctx := context.Background()
+	var hashes []string
+	var total int64
+	for _, body := range [][]byte{[]byte("v1"), []byte("version two"), []byte("v3!")} {
+		f := file(body, 0)
+		if _, e := a.Upload(ctx, f, bytes.NewReader(body)); e != nil {
+			t.Fatal(e)
+		}
+		hashes = append(hashes, f.Hash)
+		total += f.Size
+	}
+	l, e := a.CreateList(ctx, "各版本高等数学备份", hashes)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if l.Size != total {
+		t.Fatalf("list size %d, want %d", l.Size, total)
+	}
+	// The hash is the SHA-256 of the exact committed document bytes, so a client can
+	// recompute it from the document it fetches.
+	sum := sha256.Sum256(u.meta)
+	if l.Hash != hex.EncodeToString(sum[:]) {
+		t.Fatalf("list hash %s is not sha256(committed document) %s", l.Hash, u.meta)
+	}
+	if u.metaPath != a.MetaPath(l.Hash) {
+		t.Fatalf("document committed at %q", u.metaPath)
+	}
+	// The index carries no blob: only the document was written.
+	if _, ok := u.files[a.Path(l.Hash)]; ok {
+		t.Fatal("list must not write a blob")
+	}
+	// Re-creating an identical list is idempotent.
+	again, e := a.CreateList(ctx, "各版本高等数学备份", hashes)
+	if e != nil || again.Hash != l.Hash {
+		t.Fatalf("idempotent create failed: %+v %v", again, e)
+	}
+	// Describe expands entries with their own names and sizes, in document order.
+	f, entries, e := a.Describe(ctx, l.Hash)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if f.Name != "各版本高等数学备份" || len(entries) != 3 {
+		t.Fatalf("describe: %+v %v", f, entries)
+	}
+	for i, en := range entries {
+		if en.Hash != hashes[i] || en.Size == 0 || en.Name == "" {
+			t.Fatalf("entry %d: %+v", i, en)
+		}
+	}
+	// A plain file returns no entries.
+	if _, entries, e := a.Describe(ctx, hashes[0]); e != nil || entries != nil {
+		t.Fatalf("plain file described as list: %v %v", entries, e)
+	}
+}
+
+func TestCreateListRejectsInvalidInput(t *testing.T) {
+	a, u, _ := setup(t)
+	u.files = map[string][]byte{}
+	ctx := context.Background()
+	b := []byte("list member")
+	f := file(b, 0)
+	if _, e := a.Upload(ctx, f, bytes.NewReader(b)); e != nil {
+		t.Fatal(e)
+	}
+	for name, tc := range map[string]struct {
+		name   string
+		hashes []string
+	}{
+		"empty":      {"l", nil},
+		"bad name":   {"a/b", []string{f.Hash}},
+		"missing":    {"l", []string{strings.Repeat("a", 64)}},
+		"duplicate":  {"l", []string{f.Hash, f.Hash}},
+		"not a hash": {"l", []string{"nope"}},
+	} {
+		if _, e := a.CreateList(ctx, tc.name, tc.hashes); !errors.Is(e, ErrInvalid) {
+			t.Fatalf("%s accepted: %v", name, e)
+		}
+	}
+	// Too many entries.
+	many := make([]string, listLimit+1)
+	for i := range many {
+		many[i] = strings.Repeat("b", 64)
+	}
+	if _, e := a.CreateList(ctx, "l", many); !errors.Is(e, ErrInvalid) {
+		t.Fatalf("oversized list accepted: %v", e)
+	}
+	// Nesting is refused so an index stays acyclic.
+	inner, e := a.CreateList(ctx, "inner", []string{f.Hash})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e := a.CreateList(ctx, "outer", []string{inner.Hash}); !errors.Is(e, ErrInvalid) {
+		t.Fatalf("nested list accepted: %v", e)
 	}
 }
